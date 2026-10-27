@@ -223,36 +223,43 @@ def is_threads(url: str) -> bool:
     return site_of(url) == "threads"
 
 
-class _InstagramOnlyRedirects(urllib.request.HTTPRedirectHandler):
-    """Редиректы, которые не уводят с Instagram (иначе — ошибка)."""
+class _SameSiteRedirects(urllib.request.HTTPRedirectHandler):
+    """Редиректы, которые не уводят с площадки исходной ссылки (иначе — ошибка)."""
 
     max_redirections = 5
 
+    def __init__(self, site: str):
+        super().__init__()
+        self.site = site
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if site_of(newurl) != "instagram":
-            raise urllib.error.HTTPError(newurl, code, "redirect off Instagram", headers, fp)
+        if site_of(newurl) != self.site:
+            raise urllib.error.HTTPError(newurl, code, f"redirect off {self.site}", headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _resolve_share_link(url: str) -> str:
-    """instagram.com/share/… → ссылка на сам пост; остальные ссылки как есть.
+    """instagram.com/share/… и threads.com/share/… → ссылка на сам пост; остальные как есть.
 
     Экстрактор Instagram share-ссылки не берёт (в его _VALID_URL они исключены):
-    это редирект на /reel/<id> или /p/<id>. Раньше их разворачивал generic, но
-    он теперь под запретом (_ALLOWED_EXTRACTORS) — разворачиваем сами, сверяя
-    каждый шаг: увести запрос с Instagram такая ссылка не может.
+    это редирект на /reel/<id> или /p/<id>. Threads так же редиректит
+    /share/<код> на /@user/post/<id>, а наш плагин знает только вторую форму.
+    Раньше их разворачивал generic, но он теперь под запретом
+    (_ALLOWED_EXTRACTORS) — разворачиваем сами, сверяя каждый шаг: увести запрос
+    с площадки такая ссылка не может.
     """
-    if site_of(url) != "instagram" or not urlsplit(url).path.startswith("/share/"):
+    site = site_of(url)
+    if site not in ("instagram", "threads") or not urlsplit(url).path.startswith("/share/"):
         return url
-    opener = urllib.request.build_opener(_InstagramOnlyRedirects)
+    opener = urllib.request.build_opener(_SameSiteRedirects(site))
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with opener.open(request, timeout=15) as resp:
             final = resp.geturl()
     except (OSError, ValueError) as e:
-        logger.info("Instagram share-ссылку не развернуть (%s): %s", url, e)
+        logger.info("Share-ссылку не развернуть (%s): %s", url, e)
         return url
-    return final if site_of(final) == "instagram" else url
+    return final if site_of(final) == site else url
 
 
 # ── Подмена impersonate-таргета curl_cffi ───────────────────────────────────
