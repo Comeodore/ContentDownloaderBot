@@ -1,5 +1,5 @@
-# VideoDownloaderBot — деплой на сервер.
-# Каталог данных VIDEODL_DATA_DIR (задаётся в .env) монтируется в ОБА контейнера
+# Content Downloader — деплой на сервер.
+# Каталог данных CONTENTDL_DATA_DIR (задаётся в .env) монтируется в ОБА контейнера
 # по одинаковому пути /var/lib/telegram-bot-api → Bot API server отдаёт файл
 # по пути (path-режим, до 2 ГБ).
 
@@ -7,16 +7,16 @@ services:
   # ── Локальный Telegram Bot API server (снимает лимит 50 МБ → до 2 ГБ) ──
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest
-    container_name: videodl-bot-api-1
+    container_name: contentdl-bot-api-1
     restart: unless-stopped
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
       TELEGRAM_LOCAL: "true"               # local-режим: чтение файлов с диска по пути
     volumes:
-      - ${VIDEODL_DATA_DIR:-./data}:/var/lib/telegram-bot-api
+      - ${CONTENTDL_DATA_DIR:-./data}:/var/lib/telegram-bot-api
     networks:
-      - videodl
+      - contentdl
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     logging:
@@ -30,8 +30,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: videodl-bot:latest
-    container_name: videodl-bot-1
+    image: contentdl-bot:latest
+    container_name: contentdl-bot-1
     restart: unless-stopped
     env_file: ./.env
     environment:
@@ -44,9 +44,9 @@ services:
       - telegram-bot-api
     volumes:
       # ТОТ ЖЕ каталог и ТОТ ЖЕ путь, что у сервера — иначе path-режим не найдёт файл
-      - ${VIDEODL_DATA_DIR:-./data}:/var/lib/telegram-bot-api
+      - ${CONTENTDL_DATA_DIR:-./data}:/var/lib/telegram-bot-api
     networks:
-      - videodl
+      - contentdl
     labels:
       # Образ собирается локально (build:.), в registry его нет — Watchtower его не трогает.
       # yt-dlp бот обновляет сам (self-restart), код/образ — пересборкой.
@@ -61,7 +61,7 @@ services:
   # Форк nickfedor — оригинальный containrrr заброшен и не работает с Docker API ≥1.44.
   watchtower:
     image: nickfedor/watchtower:latest
-    container_name: videodl-watchtower-1
+    container_name: contentdl-watchtower-1
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -71,10 +71,10 @@ services:
       WATCHTOWER_LABEL_ENABLE: "true"       # ТОЛЬКО контейнеры с меткой enable=true
       WATCHTOWER_INCLUDE_RESTARTING: "true"
     networks:
-      - videodl
+      - contentdl
     labels:
       com.centurylinklabs.watchtower.enable: "true"
 
 networks:
-  videodl:
+  contentdl:
     driver: bridge

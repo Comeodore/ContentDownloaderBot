@@ -61,7 +61,7 @@ WELCOME = (
 # Профиль бота в Telegram: имя, описание (его видно в пустом чате до /start) и
 # короткое описание (профиль бота, его пересылка). Синхронизируем на старте
 # (см. _sync_profile) — тексты живут здесь, а не только в настройках Telegram.
-BOT_NAME = "Downloader: TikTok · Insta · YouTube · Threads"
+BOT_NAME = "Content Downloader"
 BOT_SHORT_DESCRIPTION = (
     "Send a link — get the video, photos or slideshow from TikTok, Instagram, "
     "YouTube and Threads. No watermark."
@@ -580,7 +580,7 @@ async def _heartbeat() -> None:
             pass
         # Ответа не ждём: медленный или лежащий монитор не должен тормозить этот
         # цикл. beat() сам глотает свои ошибки.
-        loop.run_in_executor(_beat_pool, lambda: beat("polling alive", service_id="videodl-bot"))
+        loop.run_in_executor(_beat_pool, lambda: beat("polling alive", service_id="contentdl-bot"))
         await asyncio.sleep(30)
 
 

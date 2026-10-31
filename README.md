@@ -1,4 +1,4 @@
-# 🎬 Video Downloader Bot
+# 📥 Content Downloader
 
 Телеграм-бот: присылаешь ссылку — получаешь видео.
 Поддержка **TikTok (без вотермарки)**, **YouTube Shorts**, **Instagram Reels**, **Threads**.
@@ -53,7 +53,7 @@ python bot.py
 Три сервиса: бот, локальный Bot API server (файлы до 2 ГБ), Watchtower.
 
 Все данные (скачанные видео + данные Bot API server) живут в одном каталоге —
-`VIDEODL_DATA_DIR` из `.env` (по умолчанию `./data`). Он монтируется в **оба**
+`CONTENTDL_DATA_DIR` из `.env` (по умолчанию `./data`). Он монтируется в **оба**
 контейнера по одному пути `/var/lib/telegram-bot-api`, иначе path-режим сервера
 не найдёт файлы бота. Если системный диск маленький — укажи каталог на большом.
 ffmpeg в образе — **отдельный бинарь** (сборки [BtbN](https://github.com/BtbN/FFmpeg-Builds),
@@ -63,28 +63,28 @@ ffmpeg в образе — **отдельный бинарь** (сборки [Bt
 
 ```bash
 # на хосте: каталог данных с владельцем uid 101 (= юзер telegram-bot-api)
-ssh root@YOUR_SERVER 'mkdir -p /path/to/videodl-data/downloads && chown -R 101:101 /path/to/videodl-data'
+ssh root@YOUR_SERVER 'mkdir -p /path/to/contentdl-data/downloads && chown -R 101:101 /path/to/contentdl-data'
 
 # .env на хосте: BOT_TOKEN, TELEGRAM_API_ID/HASH, MAX_FILE_SIZE_MB=1900,
-#                VIDEODL_DATA_DIR=/path/to/videodl-data
+#                CONTENTDL_DATA_DIR=/path/to/contentdl-data
 # залить код (если на хосте нет rsync — scp/tar):
-tar czf - --exclude=.git --exclude=.venv --exclude=.env . | ssh root@YOUR_SERVER 'tar xzf - -C /path/to/videodl-bot'
+tar czf - --exclude=.git --exclude=.venv --exclude=.env . | ssh root@YOUR_SERVER 'tar xzf - -C /path/to/contentdl-bot'
 
-ssh root@YOUR_SERVER 'cd /path/to/videodl-bot && docker compose up -d --build'
+ssh root@YOUR_SERVER 'cd /path/to/contentdl-bot && docker compose up -d --build'
 ```
 
 ### Передеплой после правок кода
 
 ```bash
-scp -r bot.py downloader.py config.py yt_dlp_plugins root@YOUR_SERVER:/path/to/videodl-bot/
-ssh root@YOUR_SERVER 'cd /path/to/videodl-bot && docker compose up -d --build bot'
+scp -r bot.py downloader.py config.py yt_dlp_plugins root@YOUR_SERVER:/path/to/contentdl-bot/
+ssh root@YOUR_SERVER 'cd /path/to/contentdl-bot && docker compose up -d --build bot'
 ```
 
 ### Полезное
 
 ```bash
-ssh root@YOUR_SERVER 'cd /path/to/videodl-bot && docker compose logs -f bot'   # логи
-ssh root@YOUR_SERVER 'cd /path/to/videodl-bot && docker compose ps'            # статус
+ssh root@YOUR_SERVER 'cd /path/to/contentdl-bot && docker compose logs -f bot'   # логи
+ssh root@YOUR_SERVER 'cd /path/to/contentdl-bot && docker compose ps'            # статус
 ```
 
 ## 🔄 Авто-обновление (двухуровневое)
