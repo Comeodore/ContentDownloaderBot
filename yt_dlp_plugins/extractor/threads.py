@@ -4,7 +4,8 @@
 Это адаптация того PR под механизм плагинов: абсолютные импорты, домен
 threads.com (threads.net теперь редиректит на него), карусель — как плейлист,
 чтобы бот отправлял её альбомом. Сверх PR добавлены фото (в самом PR только
-видео), медиа из процитированного/репостнутого поста и распознавание
+видео), медиа из процитированного/репостнутого поста и из ссылки на рилс
+Instagram, которую Threads разворачивает прямо в посте, и распознавание
 недоступного поста. Когда экстрактор появится в апстриме, этот файл можно
 удалить — но фото проверь, их там может не быть.
 
@@ -52,6 +53,14 @@ class ThreadsIE(InfoExtractor):
             'ext': 'mp4',
             'title': 'md5:062673d04195aa2d99b8d7a11798cb9d',
             'uploader_id': 'tntsportsbr',
+        },
+    }, {
+        # Текст + ссылка на рилс Instagram: видео лежит в linked_inline_media.
+        'url': 'https://www.threads.com/@zhanginsergei/post/DfNaDpOgK4s',
+        'info_dict': {
+            'id': 'DfNaDpOgK4s',
+            'ext': 'mp4',
+            'uploader_id': 'zhanginsergei',
         },
     }]
 
@@ -236,11 +245,17 @@ class ThreadsIE(InfoExtractor):
         entries = self._entries(post, video_id)
         if not entries:
             # Своих медиа нет — значит либо пост правда текстовый, либо он
-            # цитирует/репостит чужой и видео лежит там.
+            # цитирует/репостит чужой и видео лежит там, либо в тексте ссылка на
+            # рилс/пост Instagram: Threads показывает его плеером прямо в посте, а
+            # сам медиа-объект (той же формы, что пост) кладёт в
+            # linked_inline_media. Он есть и в HTML, и в ответе API.
             shared, unavailable = self._shared_post(post)
+            linked = traverse_obj(post, ('text_post_app_info', 'linked_inline_media'))
             if shared:
                 entries = self._entries(shared, video_id)
-            elif unavailable:
+            if not entries and linked:
+                entries = self._entries(linked, video_id)
+            if not entries and unavailable:
                 raise ExtractorError(
                     'The quoted post holding the media is unavailable — it may have '
                     'been deleted, or it is not shown to logged-out visitors',
