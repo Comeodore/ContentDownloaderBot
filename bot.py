@@ -11,6 +11,7 @@ import contextlib
 import glob
 import logging
 import os
+import random
 import re
 import shutil
 import signal
@@ -24,6 +25,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import (
     FSInputFile,
@@ -202,42 +204,6 @@ async def handle_link(message: Message, config: Config) -> None:
         await _handle_full(message, config, url)
 
 
-# Как часто правим сообщение с прогрессом. Telegram душит частые edit'ы
-# (~20/мин на чат), поэтому раз в 5 с — 12 правок в минуту, с запасом.
-_PROGRESS_INTERVAL = 5.0
-
-
-def _make_progress_hook(status: Message, prefix: str = "⏳ Downloading…"):
-    """Хук yt-dlp → правки статусного сообщения (для 2-гигабайтных файлов).
-
-    Хук зовётся из рабочего потока (asyncio.to_thread), поэтому корутину правки
-    отправляем в основной loop через run_coroutine_threadsafe. Первую правку
-    делаем только через интервал — мелкие файлы уходят без лишнего мигания.
-    """
-    loop = asyncio.get_running_loop()
-    state = {"t": time.monotonic()}
-
-    def hook(d: dict) -> None:
-        if d.get("status") != "downloading":
-            return
-        now = time.monotonic()
-        if now - state["t"] < _PROGRESS_INTERVAL:
-            return
-        state["t"] = now
-        done = d.get("downloaded_bytes") or 0
-        total = d.get("total_bytes") or d.get("total_bytes_estimate")
-        if total:
-            text = f"{prefix} {done * 100 // total}% of {total / 1024 / 1024:.0f} MB"
-        else:
-            text = f"{prefix} {done / 1024 / 1024:.0f} MB"
-        try:
-            asyncio.run_coroutine_threadsafe(_safe_edit(status, text), loop)
-        except RuntimeError:
-            pass  # loop уже закрыт (бот гасится) — прогресс не важен
-
-    return hook
-
-
 # Осиротевшие каталоги запросов: если процесс убили посреди скачивания
 # (плановый рестарт, OOM), rmtree в finally не выполнился и каталог остаётся
 # на диске навсегда. Подметаем на старте — там же лежат гигабайтные файлы.
@@ -272,6 +238,34 @@ _job_slots = asyncio.Semaphore(MAX_PARALLEL_JOBS)
 _jobs_in_flight = 0
 
 
+# Анимированные custom emoji «идёт работа» в конце статуса, каждый раз случайный.
+# Боту они доступны, пока у владельца бота есть Telegram Premium. Дуга — из пака
+# бота contentdl_loading_by_comeodore_download_bot (needs_repainting: Telegram
+# красит её в цвет текста), точки — из чужого пака LoadingEmojis.
+_SPINNER_IDS = (
+    "5424626441687968723",  # растущая дуга
+    "5981246029926764162",  # серые точки
+)
+
+
+def _spinner() -> str:
+    # ⏳ — запасной символ: его видно в уведомлениях и превью чата.
+    return f'<tg-emoji emoji-id="{random.choice(_SPINNER_IDS)}">⏳</tg-emoji>'
+
+
+async def _send_status(message: Message, text: str) -> Message:
+    """Статусное сообщение; не принял Telegram custom emoji — шлём без них.
+
+    Без этого кончившийся Premium владельца ронял бы обработку любой ссылки
+    на самом первом сообщении.
+    """
+    try:
+        return await message.answer(text)
+    except TelegramBadRequest:
+        logger.warning("Telegram не принял custom emoji в статусе — шлю без них")
+        return await message.answer(re.sub(r"<tg-emoji[^>]*>(.*?)</tg-emoji>", r"\1", text))
+
+
 @contextlib.asynccontextmanager
 async def _job(status: Message, working_text: str):
     """Место в очереди запросов; пока ждём — статус об этом говорит."""
@@ -280,7 +274,7 @@ async def _job(status: Message, working_text: str):
     try:
         queued = _job_slots.locked()
         if queued:
-            await _safe_edit(status, "⏳ Waiting in line — other downloads are running…")
+            await _safe_edit(status, f"Waiting in line — other downloads are running {_spinner()}")
         async with _job_slots:
             if queued:
                 await _safe_edit(status, working_text)
@@ -305,15 +299,19 @@ async def _report_download_error(
 
 
 async def _handle_full(message: Message, config: Config, url: str) -> None:
-    status = await message.answer("⏳ Downloading…")
+    # Статус один на всё время — и скачивание, и отправку. Процентов нет: мелкие
+    # файлы докачивались раньше второй правки, и видно было только «0%», а
+    # прогресс отправки боту не виден вовсе — в path-режиме файл в Telegram
+    # заливает сам Bot API server, бот лишь ждёт ответа.
+    working_text = f"Downloading {_spinner()}"
+    status = await _send_status(message, working_text)
 
-    async with _job(status, "⏳ Downloading…"):
+    async with _job(status, working_text):
         os.makedirs(config.download_dir, exist_ok=True)
         work_dir = tempfile.mkdtemp(prefix="vdl_", dir=config.download_dir)
         try:
             try:
-                result = await downloader.download(
-                    url, config, work_dir, _make_progress_hook(status))
+                result = await downloader.download(url, config, work_dir)
             except downloader.DownloadError as e:
                 await _report_download_error(message, status, config, url, e)
                 return
@@ -331,10 +329,6 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
             if result.cookies_stale:
                 await _notify_owner_cookies(message.bot, config, stale_session=True)
 
-            # «Отправляю…» показываем только для крупных файлов (мелкие уходят мгновенно).
-            # Эмодзи тот же, чтобы не было «прыжка» глифа.
-            if result.total_size > 25 * 1024 * 1024:
-                await _safe_edit(status, "⏳ Uploading…")
             try:
                 await _send_media(message, result, url)
                 await status.delete()
@@ -363,16 +357,15 @@ async def _handle_cut(
             f"{_fmt_ts(MAX_CUT_SECONDS)} per message."
         )
         return
-    working_text = f"✂️ Cutting {len(ranges)} clip(s)…"
-    status = await message.answer(working_text)
+    working_text = f"Cutting {len(ranges)} clip(s) {_spinner()}"
+    status = await _send_status(message, working_text)
 
     async with _job(status, working_text):
         os.makedirs(config.download_dir, exist_ok=True)
         work_dir = tempfile.mkdtemp(prefix="cut_", dir=config.download_dir)
         try:
             try:
-                result = await downloader.download_clips(
-                    url, config, work_dir, ranges, _make_progress_hook(status, working_text))
+                result = await downloader.download_clips(url, config, work_dir, ranges)
             except downloader.DownloadError as e:
                 await _report_download_error(message, status, config, url, e)
                 return

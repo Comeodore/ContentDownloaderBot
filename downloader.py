@@ -726,18 +726,11 @@ def _ensure_telegram_playable(path: str) -> str:
     return final
 
 
-def _download_blocking(
-    url: str,
-    config: Config,
-    work_dir: str,
-    progress_hook: Callable[[dict], None] | None = None,
-) -> DownloadResult:
+def _download_blocking(url: str, config: Config, work_dir: str) -> DownloadResult:
     url = _resolve_share_link(_normalize_url(url))
     # autonumber сохраняет порядок элементов карусели
     out_template = os.path.join(work_dir, "%(autonumber)03d-%(id)s.%(ext)s")
     opts = _build_opts(config, out_template, url, work_dir)
-    if progress_hook:
-        opts["progress_hooks"] = [progress_hook]
 
     info = _extract_info(opts, url)
     _reject_live(info)
@@ -800,14 +793,9 @@ def _download_blocking(
     )
 
 
-async def download(
-    url: str,
-    config: Config,
-    work_dir: str,
-    progress_hook: Callable[[dict], None] | None = None,
-) -> DownloadResult:
+async def download(url: str, config: Config, work_dir: str) -> DownloadResult:
     """Асинхронная обёртка — yt-dlp блокирующий, гоняем в thread pool."""
-    return await asyncio.to_thread(_download_blocking, url, config, work_dir, progress_hook)
+    return await asyncio.to_thread(_download_blocking, url, config, work_dir)
 
 
 # ── Нарезка: качаем с площадки только нужные куски ──────────────────────────
@@ -844,7 +832,6 @@ def _download_clips_blocking(
     config: Config,
     work_dir: str,
     ranges: list[tuple[int, int]],
-    progress_hook: Callable[[dict], None] | None = None,
 ) -> ClipsResult:
     """Качает с площадки только куски ranges, а не всё видео.
 
@@ -870,8 +857,6 @@ def _download_clips_blocking(
         # Сбой одного куска не роняет остальные; ошибки извлечения — как обычно.
         "ignoreerrors": "only_download",
     })
-    if progress_hook:
-        opts["progress_hooks"] = [progress_hook]
 
     info = _extract_info(opts, url)
     _reject_live(info)
@@ -907,7 +892,5 @@ def _download_clips_blocking(
 
 async def download_clips(
     url: str, config: Config, work_dir: str, ranges: list[tuple[int, int]],
-    progress_hook: Callable[[dict], None] | None = None,
 ) -> ClipsResult:
-    return await asyncio.to_thread(
-        _download_clips_blocking, url, config, work_dir, ranges, progress_hook)
+    return await asyncio.to_thread(_download_clips_blocking, url, config, work_dir, ranges)
