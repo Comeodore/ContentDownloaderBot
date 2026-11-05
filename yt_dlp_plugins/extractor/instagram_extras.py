@@ -19,9 +19,17 @@ InstagramIE и InstagramStoryIE (к имени добавляется «+videobo
 это pk медиа: media/<pk>/info/ под сессией отдаёт её целиком. Поэтому сторис
 по ссылке с номером берём так, а остальное (хайлайты, «все сторис автора») —
 по-старому.
+
+Сторис живёт 24 часа. На истёкшую (как и на удалённую или закрытую) media/<pk>/
+info/ под живой сессией отвечает 400 «Media not found or unavailable» (проверено
+2026-11-05). Дальше по-старому идти нельзя: reels_media отдаст пусто, yt-dlp
+скажет «You need to log in», а бот примет это за протухшие cookies и дёрнет
+владельца. Поэтому на этот ответ — своя ошибка «сторис больше нет». Любой другой
+сбой запроса по-прежнему уходит в yt-dlp: протухшая сессия так и останется
+ошибкой логина.
 """
 from yt_dlp.extractor.instagram import InstagramIE, InstagramStoryIE
-from yt_dlp.utils import determine_ext, traverse_obj, url_or_none
+from yt_dlp.utils import ExtractorError, determine_ext, traverse_obj, url_or_none
 
 from yt_dlp_plugins.extractor._images import best_image
 
@@ -61,14 +69,20 @@ class _InstagramStoryIE(InstagramStoryIE, plugin_name='videobot'):
         username, story_id = self._match_valid_url(url).group('user', 'id')
         # Без сессии сторис не отдаются вовсе — пусть yt-dlp скажет это сам.
         if story_id and username != 'highlights' and self._is_logged_in:
-            item = traverse_obj(self._download_json(
+            info = self._download_json(
                 f'{self._API_BASE_URL}/media/{story_id}/info/', story_id,
                 'Downloading story info', 'Story info request failed', fatal=False,
-                headers=self._api_headers,
-                impersonate=self._can_impersonate and self._is_web_app), ('items', 0, {dict}))
+                expected_status=400, headers=self._api_headers,
+                impersonate=self._can_impersonate and self._is_web_app)
+            item = traverse_obj(info, ('items', 0, {dict}))
             if item:
                 return {
                     **self._extract_product(item, get_comments=False),
                     'title': f'Story by {username}',
                 }
+            if 'not found or unavailable' in str(traverse_obj(info, 'message') or '').lower():
+                # Текст без «login»/«private»: иначе бот сочтёт это проблемой cookies.
+                raise ExtractorError(
+                    'Instagram story is gone: expired, deleted or hidden', expected=True,
+                    video_id=story_id)
         return super()._real_extract(url)

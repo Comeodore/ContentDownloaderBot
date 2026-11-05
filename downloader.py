@@ -360,6 +360,10 @@ _ERROR_MESSAGES = (
      "or visible only to logged-in users."),
     (("has no photo or video",),
      "This post is text only — no photo or video in it."),
+    # Плагин Instagram: сторис по ссылке нет (они живут 24 ч). Не ошибка логина.
+    (("instagram story is gone",),
+     "This story is no longer available — stories disappear after 24 hours, "
+     "and deleted ones or ones from private accounts can't be downloaded."),
     # Эфиры, которые YouTube не отдаёт сам (идущий без записи, будущая премьера).
     (("live stream recording is not available", "live event will begin", "premieres in"),
      _LIVE_MESSAGE),
