@@ -57,23 +57,9 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ── Watchtower: авто-обновление образов (только помеченных enable=true) ──
-  # Форк nickfedor — оригинальный containrrr заброшен и не работает с Docker API ≥1.44.
-  watchtower:
-    image: nickfedor/watchtower:latest
-    container_name: contentdl-watchtower-1
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      WATCHTOWER_CLEANUP: "true"
-      WATCHTOWER_POLL_INTERVAL: "86400"     # раз в сутки
-      WATCHTOWER_LABEL_ENABLE: "true"       # ТОЛЬКО контейнеры с меткой enable=true
-      WATCHTOWER_INCLUDE_RESTARTING: "true"
-    networks:
-      - contentdl
-    labels:
-      com.centurylinklabs.watchtower.enable: "true"
+# Своего Watchtower в стеке НЕТ: на хосте ubuntu работает общий watchtower
+# (/root/docker-compose.yml), он обновляет contentdl-bot-api-1 по имени. Второй
+# экземпляр без scope при старте останавливает и удаляет первый.
 
 networks:
   contentdl:
