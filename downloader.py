@@ -122,7 +122,7 @@ class DownloadResult:
     title: str = "video"
     description: str = ""
     total_size: int = 0
-    # True — скачалось только без cookies: сохранённая сессия негодна (см. _extract_info).
+    # True — скачалось только без cookies: сохранённая сессия негодна (см. _STALE_COOKIES_KEY).
     cookies_stale: bool = False
 
 
@@ -493,7 +493,9 @@ def merge_cookies_file(upload_path: str, target_path: str) -> list[str]:
 
 # Метка в info-словаре: скачалось только анонимно, сессия в cookies.txt негодна.
 # Кладём в сам словарь, а не в глобал — скачивания идут в разных потоках.
-_STALE_COOKIES_KEY = "__videobot_threads_cookies_stale"
+# Для Threads ставит _extract_info, для Instagram — плагин (instagram_extras,
+# STALE_COOKIES_KEY): импортировать его отсюда нельзя, плагины грузит yt-dlp.
+_STALE_COOKIES_KEY = "__videobot_cookies_stale"
 
 
 def _extract_info(opts: dict, url: str) -> dict:

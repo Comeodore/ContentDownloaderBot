@@ -325,9 +325,10 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
                         len(result.items), result.total_size / 1024 / 1024)
 
             # Скачалось только без cookies — сессия негодна: владельцу стоит знать,
-            # иначе закрытые посты будут молча недоступны (см. _extract_info).
+            # иначе закрытые посты будут молча недоступны (см. _STALE_COOKIES_KEY).
             if result.cookies_stale:
-                await _notify_owner_cookies(message.bot, config, stale_session=True)
+                await _notify_owner_cookies(
+                    message.bot, config, stale_site=downloader.site_of(url))
 
             try:
                 await _send_media(message, result, url)
@@ -378,7 +379,8 @@ async def _handle_cut(
             logger.info("Нарезано для %s: %s — %d из %d клип(ов)", _who(message), url,
                         len(result.clips), len(ranges))
             if result.cookies_stale:
-                await _notify_owner_cookies(message.bot, config, stale_session=True)
+                await _notify_owner_cookies(
+                    message.bot, config, stale_site=downloader.site_of(url))
 
             vdur = result.duration
             sent = 0
@@ -512,13 +514,14 @@ def _needs_cookies(url: str) -> bool:
 
 
 async def _notify_owner_cookies(
-    bot: Bot, config: Config, stale_session: bool = False,
+    bot: Bot, config: Config, stale_site: str | None = None,
 ) -> None:
     """Сообщает владельцу о протухших cookies (не чаще раза в 6 часов).
 
-    stale_session=True — частный случай Threads: пост скачался только после
-    того, как cookies отбросили. Значит сессия не просто «не хватило прав», а
-    активно мешает: с ней Threads не отдаёт даже публичные посты.
+    stale_site — пост скачался только без сессии этой площадки (cookies_stale):
+    сессия не просто «не хватило прав», а негодна. Threads с ней не отдаёт даже
+    публичные посты; Instagram отправляет её на страницу логина, и закрытое
+    (приватные аккаунты, сторис) не качается, пока её не заменят.
     """
     if not config.owner_id:
         return
@@ -532,7 +535,17 @@ async def _notify_owner_cookies(
         "<b>threads.com</b> — and send it here as a document. I merge it into "
         "the existing file, so the other sites keep working."
     )
-    if stale_session:
+    if stale_site == "instagram":
+        text = (
+            "⚠️ The saved <b>instagram.com</b> session has expired: Instagram "
+            "sends it to the login page, so this post came through only as a "
+            "guest. Private accounts and stories won't download until it's "
+            "replaced.\n"
+            "Export cookies.txt for <b>instagram.com</b> (logged in, with "
+            "httpOnly cookies) and send it here as a document — I merge it into "
+            "the existing file, so the other sites keep working."
+        )
+    elif stale_site == "threads":
         text = (
             "⚠️ The saved <b>threads.com</b> session is being refused: this post "
             "only came through after I dropped the cookies. While that session "
