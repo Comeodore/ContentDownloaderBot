@@ -127,9 +127,10 @@ class DownloadResult:
 class DownloadError(Exception):
     """Пользовательская ошибка скачивания (текст показываем пользователю).
 
-    auth=True — проблема с доступом (login required / rate-limit / приватный),
-    обычно означает протухшие cookies → повод уведомить владельца. Гостю без
-    сессии в cookies.txt её не ставим: чинить нечего (см. _extract_info).
+    auth=True — сохранённые cookies площадки не сработали (login required /
+    rate-limit / протухшая сессия) → повод уведомить владельца. Когда cookies
+    площадки у бота нет вовсе, не ставим: чинить нечего, а пользователь и так
+    видит «Cookie problem» (см. _extract_info).
     no_post=True — страницу поста вообще не отдали (редирект на главную,
     заготовка без данных, 404): пост скрыт от гостя → есть смысл переспросить
     под сессией, см. _extract_info.
@@ -335,6 +336,10 @@ _AUTH_MARKERS = (
     "for the authentication",
 )
 
+# Так наш плагин Instagram называет ответ API «на страницу логина» под
+# сессией: протухли именно cookies, а не пост закрыт.
+_SESSION_EXPIRED_MARKERS = ("session expired",)
+
 # Симптомы «страницу поста нам не отдали»: редирект на главную, страница-
 # заготовка без данных поста, 404 на весь домен. Так выглядит и закрытый пост,
 # и — что важнее — негодная сессия из cookies.txt (Threads на неё отвечает так
@@ -395,7 +400,12 @@ def _raw_error(e: Exception) -> str:
     return lines[-1].strip() if lines else ""
 
 
-def _as_download_error(e: Exception) -> DownloadError:
+def _cookies_name(site: str | None) -> str:
+    """Как ошибки называют cookies площадки: «instagram.com cookies»."""
+    return f"{_SITES[site][0]} cookies" if site in _SITES else "cookies for this site"
+
+
+def _as_download_error(e: Exception, site: str | None = None) -> DownloadError:
     clean = _YTDLP_PREFIX_RE.sub("", _raw_error(e))
     low = clean.lower()
 
@@ -405,10 +415,20 @@ def _as_download_error(e: Exception) -> DownloadError:
     no_media = any(marker in low for marker in _NO_MEDIA_MARKERS)
     waf = any(marker in low for marker in _WAF_MARKERS)
 
+    # Ошибки доступа — проблема cookies, так прямо и пишем. Этот текст доходит
+    # до пользователя, только когда cookies площадки были в запросе: без них
+    # _extract_info заменяет его на «у бота нет cookies».
+    cookies = _cookies_name(site)
+    if any(marker in low for marker in _SESSION_EXPIRED_MARKERS):
+        return DownloadError(
+            f"Cookie problem: the saved {cookies} have expired — the site sends "
+            "the bot to its login page.",
+            auth=True, no_post=no_post,
+        )
     if any(marker in low for marker in _AUTH_MARKERS):
         return DownloadError(
-            "This needs a login: the post is private, or the saved cookies "
-            "have expired.",
+            f"Cookie problem: this needs a login, and the saved {cookies} didn't "
+            "get through — they've expired, or their account can't see this.",
             auth=True, no_post=no_post,
         )
     for markers, text in _ERROR_MESSAGES:
@@ -505,16 +525,22 @@ _GUEST_FIRST_SITES = ("instagram", "threads")
 _SESSION_COOKIE = "sessionid"
 
 
-def _has_session(cookiefile: str | None, site: str) -> bool:
-    """Есть ли в cookies.txt сессия площадки (sessionid на её домене)."""
-    if not cookiefile:
+def _has_session(cookiefile: str | None, site: str | None) -> bool:
+    """Есть ли в cookies.txt вход на площадку.
+
+    У Instagram и Threads это sessionid на её домене. У остальных — любые её
+    cookies: имя сессии у них своё, а разлогиненный экспорт не отличить.
+    """
+    if not cookiefile or site not in _SITES:
         return False
     domains = _SITES[site]
     try:
         with open(cookiefile, encoding="utf-8", errors="replace") as f:
             for line in f:
                 key = _cookie_key(line)
-                if not key or key[2] != _SESSION_COOKIE:
+                if not key:
+                    continue
+                if site in _GUEST_FIRST_SITES and key[2] != _SESSION_COOKIE:
                     continue
                 d = _site_domain(key[0])
                 if any(d == s or d.endswith("." + s) for s in domains):
@@ -524,12 +550,32 @@ def _has_session(cookiefile: str | None, site: str) -> bool:
     return False
 
 
+def _no_cookies_error(site: str | None, cause: DownloadError) -> DownloadError:
+    """Площадка просит логин, а cookies для неё у бота нет — так и пишем.
+
+    auth=False: владельцу напоминать нечего — cookies он убрал сам или ещё не
+    загружал.
+    """
+    what = (" (a story, a private account, or a post hidden from logged-out visitors)"
+            if site in _GUEST_FIRST_SITES else "")
+    return DownloadError(
+        f"Cookie problem: this needs a login{what}, and the bot has no "
+        f"{_cookies_name(site)}.",
+        no_post=cause.no_post, no_media=cause.no_media,
+    )
+
+
 def _extract_info(opts: dict, url: str) -> dict:
     """extract_info; Instagram и Threads — гостем, а не вышло — под сессией."""
     site = site_of(url)
-    if site not in _GUEST_FIRST_SITES:
-        return _extract_info_attempts(opts, url)
     cookiefile = opts.get("cookiefile")
+    if site not in _GUEST_FIRST_SITES:
+        try:
+            return _extract_info_attempts(opts, url)
+        except DownloadError as e:
+            if not e.auth or _has_session(cookiefile, site):
+                raise
+            raise _no_cookies_error(site, e) from e
     try:
         return _extract_info_attempts({**opts, "cookiefile": None}, url)
     except DownloadError as guest:
@@ -540,28 +586,31 @@ def _extract_info(opts: dict, url: str) -> dict:
             raise
         if not _has_session(cookiefile, site):
             # Сессии нет — владелец её убрал или ещё не загрузил. Напоминать
-            # ему про cookies незачем (auth=False), а пользователю — честно.
-            if not guest.auth:
-                raise
-            raise DownloadError(
-                "This needs a login — it's a story, a private account, or a post "
-                "hidden from logged-out visitors, and the bot isn't logged in to "
-                "this site.",
-                no_post=guest.no_post, no_media=guest.no_media,
-            ) from guest
+            # ему про cookies незачем (auth=False), а пользователю — прямо, что
+            # дело в cookies.
+            if guest.auth:
+                raise _no_cookies_error(site, guest) from guest
+            if guest.no_post:
+                raise DownloadError(
+                    "The site didn't hand over this post: it's deleted, or it's a "
+                    "cookie problem — the post is for logged-in users only, and the "
+                    f"bot has no {_cookies_name(site)}.",
+                    no_post=True,
+                ) from guest
+            raise
         logger.info("%s: гостем не вышло (%s) — пробую под сессией", site, guest)
         try:
             return _extract_info_attempts(opts, url)
         except DownloadError as e:
-            if not (guest.no_post and e.no_post):
+            if e.auth or not e.no_post:
                 raise
-            # Ни гостю, ни сессии страницы поста не отдали. Пост может быть
-            # правда удалён или закрыт, но сессия не помогла — владельцу стоит
-            # её проверить (Threads на негодную сессию отвечает именно так).
+            # Страницу поста не отдали и под сессией. Пост может быть правда
+            # удалён или закрыт, но сессия не помогла — владельцу стоит её
+            # проверить (Threads на негодную сессию отвечает именно так).
             raise DownloadError(
-                "The site didn't hand over this post, with the saved cookies or "
-                "without them — it's deleted, or shown only to a narrower "
-                "audience than the saved session belongs to.",
+                "The site didn't hand over this post, as a guest or with the saved "
+                f"{_cookies_name(site)}: it's deleted, or it's a cookie problem — "
+                "the cookies have expired, or their account can't see this post.",
                 auth=True, no_post=True,
             ) from e
 
@@ -575,14 +624,15 @@ def _extract_info_attempts(opts: dict, url: str) -> dict:
     страницей без данных поста, а удалённое видео отвечало бы ошибкой вчетверо
     дольше.
     """
-    candidates = _impersonate_candidates() if site_of(url) == "tiktok" else [None]
+    site = site_of(url)
+    candidates = _impersonate_candidates() if site == "tiktok" else [None]
     for attempt, target in enumerate(candidates, start=1):
         _pinned.target = target
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=True)
         except yt_dlp.utils.DownloadError as e:
-            err = _as_download_error(e)
+            err = _as_download_error(e, site)
             # Сырой текст yt-dlp — в лог: пользователю уходит перевод, а по
             # переводу причину не восстановить.
             logger.warning(
