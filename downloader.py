@@ -122,20 +122,19 @@ class DownloadResult:
     title: str = "video"
     description: str = ""
     total_size: int = 0
-    # True — скачалось только без cookies: сохранённая сессия негодна (см. _STALE_COOKIES_KEY).
-    cookies_stale: bool = False
 
 
 class DownloadError(Exception):
     """Пользовательская ошибка скачивания (текст показываем пользователю).
 
     auth=True — проблема с доступом (login required / rate-limit / приватный),
-    обычно означает протухшие cookies → повод уведомить владельца.
+    обычно означает протухшие cookies → повод уведомить владельца. Гостю без
+    сессии в cookies.txt её не ставим: чинить нечего (см. _extract_info).
     no_post=True — страницу поста вообще не отдали (редирект на главную,
-    заготовка без данных, 404). Признак негодной сессии → есть смысл
-    переспросить анонимно, см. _extract_info.
-    no_media=True — пост отдали, но медиа в нём не нашлось. Под сессией это
-    может быть урезанный ответ API → тоже переспрашиваем анонимно.
+    заготовка без данных, 404): пост скрыт от гостя → есть смысл переспросить
+    под сессией, см. _extract_info.
+    no_media=True — пост отдали, но медиа в нём не нашлось → тоже
+    переспрашиваем под сессией.
     waf=True — WAF площадки отверг TLS-отпечаток (TikTok): есть смысл повторить
     с другим impersonate-таргетом, см. _extract_info_attempts.
     """
@@ -331,6 +330,9 @@ _YTDLP_PREFIX_RE = re.compile(r"^ERROR:\s*(?:\[[^\]]+\]\s*)?(?:[\w.-]+:\s+)?")
 _AUTH_MARKERS = (
     "login", "log in", "sign in", "rate-limit", "rate limit", "private",
     "empty media response", "requires authentication", "not a bot",
+    # Подсказка yt-dlp «Use --cookies… for the authentication»: так гостю
+    # отвечают на сторис Instagram («This content is unreachable»).
+    "for the authentication",
 )
 
 # Симптомы «страницу поста нам не отдали»: редирект на главную, страница-
@@ -491,61 +493,77 @@ def merge_cookies_file(upload_path: str, target_path: str) -> list[str]:
     return sorted(sites)
 
 
-# Метка в info-словаре: скачалось только анонимно, сессия в cookies.txt негодна.
-# Кладём в сам словарь, а не в глобал — скачивания идут в разных потоках.
-# Для Threads ставит _extract_info, для Instagram — плагин (instagram_extras,
-# STALE_COOKIES_KEY): импортировать его отсюда нельзя, плагины грузит yt-dlp.
-_STALE_COOKIES_KEY = "__videobot_cookies_stale"
+# Instagram и Threads качаем сначала гостем, а сессией из cookies.txt — только
+# то, что гостю не отдали (сторис, закрытые аккаунты, скрытые от гостей посты).
+# Сессия — живой аккаунт, и каждый запрос под ним засчитывается ему: бот открыт
+# всем, раньше все ссылки шли через сессию, и 2026-11-06 Instagram залочил
+# аккаунт владельца за автоматическую активность. Гостю публичные посты,
+# рилсы и карусели отдаются; у Threads гостевой HTML ещё и полнее приватного
+# API (в API у цитат бывает пусто, гостю они приходят с видео).
+_GUEST_FIRST_SITES = ("instagram", "threads")
+# Запись сессии у обеих площадок; без неё «под cookies» — тот же гость.
+_SESSION_COOKIE = "sessionid"
+
+
+def _has_session(cookiefile: str | None, site: str) -> bool:
+    """Есть ли в cookies.txt сессия площадки (sessionid на её домене)."""
+    if not cookiefile:
+        return False
+    domains = _SITES[site]
+    try:
+        with open(cookiefile, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                key = _cookie_key(line)
+                if not key or key[2] != _SESSION_COOKIE:
+                    continue
+                d = _site_domain(key[0])
+                if any(d == s or d.endswith("." + s) for s in domains):
+                    return True
+    except OSError:
+        logger.exception("Не удалось прочитать cookies")
+    return False
 
 
 def _extract_info(opts: dict, url: str) -> dict:
-    """extract_info; для Threads с cookies — с откатом на анонимную попытку."""
-    try:
+    """extract_info; Instagram и Threads — гостем, а не вышло — под сессией."""
+    site = site_of(url)
+    if site not in _GUEST_FIRST_SITES:
         return _extract_info_attempts(opts, url)
-    except DownloadError as e:
-        # Threads жёстко валидирует сессию: на негодную cookie он отдаёт 404 или
-        # редирект на главную для ЛЮБОЙ страницы — даже для публичного поста,
-        # который открывается анонимно (проверено: поддельный sessionid на домене
-        # threads.com роняет заведомо рабочий пост, а без него тот же пост
-        # качается). Поэтому если с cookies не вышло — пробуем ещё раз без них,
-        # иначе протухшая запись ломала бы Threads целиком.
-        #
-        # Повод — no_post (страницу поста не отдали): это и есть симптом
-        # негодной сессии. И no_media: под сессией плагин берёт пост из
-        # приватного API, а там цитаты может не быть вовсе, хотя гостевой HTML
-        # её отдаёт вместе с видео. Проверено на
-        # @margarita_oliverivna/post/Dev_Rq2Dva9: API — media_type 19 и пустой
-        # share_info, ни code, ни pk процитированного поста во всём ответе.
-        if (e.auth or not (e.no_post or e.no_media)
-                or not (is_threads(url) and opts.get("cookiefile"))):
+    cookiefile = opts.get("cookiefile")
+    try:
+        return _extract_info_attempts({**opts, "cookiefile": None}, url)
+    except DownloadError as guest:
+        # Сессия может помочь, только если гостю не хватило прав (auth), пост
+        # от гостя скрыт (no_post) или отдан урезанным (no_media). Удалённое
+        # видео, таймаут, лимит размера под сессией будут теми же.
+        if not (guest.auth or guest.no_post or guest.no_media):
             raise
-        logger.info("Threads: не вышло с cookies (%s) — пробую анонимно", e)
-        try:
-            info = _extract_info_attempts({**opts, "cookiefile": None}, url)
-        except DownloadError as anon:
-            # Сессия пост отдала, и он правда без медиа — её ответ и показываем:
-            # что гостю пост не виден, ничего к нему не добавляет.
-            if e.no_media:
-                raise e from anon
-            if not anon.no_post:
+        if not _has_session(cookiefile, site):
+            # Сессии нет — владелец её убрал или ещё не загрузил. Напоминать
+            # ему про cookies незачем (auth=False), а пользователю — честно.
+            if not guest.auth:
                 raise
-            # Ни с сессией, ни без неё страницы поста нет. Пост может быть правда
-            # закрыт/удалён, но сессия у нас есть и она не помогла — владельцу
-            # стоит проверить cookies, поэтому auth=True.
+            raise DownloadError(
+                "This needs a login — it's a story, a private account, or a post "
+                "hidden from logged-out visitors, and the bot isn't logged in to "
+                "this site.",
+                no_post=guest.no_post, no_media=guest.no_media,
+            ) from guest
+        logger.info("%s: гостем не вышло (%s) — пробую под сессией", site, guest)
+        try:
+            return _extract_info_attempts(opts, url)
+        except DownloadError as e:
+            if not (guest.no_post and e.no_post):
+                raise
+            # Ни гостю, ни сессии страницы поста не отдали. Пост может быть
+            # правда удалён или закрыт, но сессия не помогла — владельцу стоит
+            # её проверить (Threads на негодную сессию отвечает именно так).
             raise DownloadError(
                 "The site didn't hand over this post, with the saved cookies or "
                 "without them — it's deleted, or shown only to a narrower "
                 "audience than the saved session belongs to.",
                 auth=True, no_post=True,
-            ) from anon
-        if e.no_media:
-            # Сессия рабочая — пост она отдала, просто без медиа. Не протухла.
-            return info
-        # Анонимно получилось, а с cookies — нет. С рабочей сессией так не
-        # бывает: значит запись для threads.com протухла и режет доступ.
-        logger.warning("Threads: cookies протухли — без них пост открылся, с ними нет")
-        info[_STALE_COOKIES_KEY] = True
-        return info
+            ) from e
 
 
 def _extract_info_attempts(opts: dict, url: str) -> dict:
@@ -795,7 +813,6 @@ def _download_blocking(url: str, config: Config, work_dir: str) -> DownloadResul
         title=info.get("title") or "video",
         description=description,
         total_size=total,
-        cookies_stale=bool(info.get(_STALE_COOKIES_KEY)),
     )
 
 
@@ -814,7 +831,6 @@ class ClipsResult:
     # Диапазонов, что начинаются за концом видео, нет ни там, ни там.
     clips: dict[int, MediaItem] = field(default_factory=dict)
     errors: dict[int, str] = field(default_factory=dict)
-    cookies_stale: bool = False
 
 
 def _clip_sections(ranges: list[tuple[int, int]]) -> Callable:
@@ -867,10 +883,7 @@ def _download_clips_blocking(
     info = _extract_info(opts, url)
     _reject_live(info)
 
-    result = ClipsResult(
-        duration=_to_int(info.get("duration")),
-        cookies_stale=bool(info.get(_STALE_COOKIES_KEY)),
-    )
+    result = ClipsResult(duration=_to_int(info.get("duration")))
     for i, (start, _end) in enumerate(ranges):
         if result.duration and start >= result.duration:
             continue

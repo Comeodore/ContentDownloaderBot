@@ -25,28 +25,30 @@ info/ под живой сессией отвечает 400 «Media not found or
 2026-11-05). Дальше по-старому идти нельзя: reels_media отдаст пусто, yt-dlp
 скажет «You need to log in», а бот примет это за протухшие cookies и дёрнет
 владельца. Поэтому на этот ответ — своя ошибка «сторис больше нет». Любой другой
-сбой запроса по-прежнему уходит в yt-dlp: протухшая сессия так и останется
-ошибкой логина.
+сбой запроса по-прежнему уходит в yt-dlp (кроме протухшей сессии, см. ниже).
 
-Протухшая сессия у постов. Под cookies yt-dlp берёт пост из media/<pk>/info/,
-а на негодную сессию откатывается в гостевой путь — но только если ответ пришёл
-HTTP-ошибкой с редиректом на логин. Instagram же отвечает редиректом на
-/accounts/login/ и там 200 с HTML (проверено 2026-11-06): yt-dlp пытается
-прочесть страницу логина как JSON и падает «Failed to parse JSON» — посты под
-протухшей сессией не качались вовсе, хотя гостю они открыты. Поэтому такой
-ответ API превращаем в ту HTTP-ошибку, которую yt-dlp ждёт: он сам скажет, что
-cookies негодны, сбросит sessionid и пойдёт гостем. А пост помечаем
-STALE_COOKIES_KEY — бот попросит владельца обновить cookies.
+Протухшая сессия. На негодную сессию API Instagram отвечает редиректом на
+/accounts/login/ и там 200 с HTML (проверено 2026-11-06). yt-dlp ловит только
+HTTP-ошибку с таким редиректом, а тут пытается прочесть страницу логина как
+JSON и падает «Failed to parse JSON» — непонятно ни пользователю, ни владельцу.
+Поэтому такой ответ API сразу превращаем в ошибку «сессия протухла» (в тексте
+«login» — бот попросит владельца обновить cookies). Откат гостем, как в
+yt-dlp, тут не нужен: под сессией бот идёт, только когда гостем уже не вышло
+(downloader._extract_info).
 """
 from yt_dlp.extractor.instagram import InstagramIE, InstagramStoryIE
-from yt_dlp.networking.exceptions import HTTPError
 from yt_dlp.utils import ExtractorError, determine_ext, traverse_obj, url_or_none
 
 from yt_dlp_plugins.extractor._images import best_image
 
-# Метка в info-словаре: скачалось только без сессии, она негодна. Тот же ключ
-# читает downloader.py (_STALE_COOKIES_KEY).
-STALE_COOKIES_KEY = '__videobot_cookies_stale'
+
+def _refuse_login_redirect(ie, url_or_request, urlh, logged_in):
+    """Ответ API под сессией, приведший на страницу логина, — ошибка сессии."""
+    url = getattr(url_or_request, 'url', url_or_request)
+    if logged_in and urlh and '/api/v1/' in str(url) and ie._is_login_redirect(urlh.url):
+        raise ExtractorError(
+            'Instagram session expired: the API sent it to the login page', expected=True)
+    return urlh
 
 
 def _with_photo_format(info, product_media):
@@ -72,34 +74,26 @@ def _with_photo_format(info, product_media):
 
 
 class _InstagramIE(InstagramIE, plugin_name='videobot'):
-    _session_refused = False
-
     def _extract_product_media(self, product_media):
         return _with_photo_format(super()._extract_product_media(product_media), product_media)
 
     def _request_webpage(self, url_or_request, *args, **kwargs):
         # До запроса: Set-Cookie по дороге на логин может стереть sessionid.
         logged_in = self._is_logged_in
-        urlh = super()._request_webpage(url_or_request, *args, **kwargs)
-        url = getattr(url_or_request, 'url', url_or_request)
-        if (logged_in and urlh and '/api/v1/' in str(url)
-                and self._is_login_redirect(urlh.url)):
-            self._session_refused = True
-            raise ExtractorError(
-                'Instagram API redirected to the login page', cause=HTTPError(urlh))
-        return urlh
-
-    def _real_extract(self, url):
-        self._session_refused = False
-        info = super()._real_extract(url)
-        if self._session_refused:
-            info[STALE_COOKIES_KEY] = True
-        return info
+        return _refuse_login_redirect(
+            self, url_or_request, super()._request_webpage(url_or_request, *args, **kwargs),
+            logged_in)
 
 
 class _InstagramStoryIE(InstagramStoryIE, plugin_name='videobot'):
     def _extract_product_media(self, product_media):
         return _with_photo_format(super()._extract_product_media(product_media), product_media)
+
+    def _request_webpage(self, url_or_request, *args, **kwargs):
+        logged_in = self._is_logged_in
+        return _refuse_login_redirect(
+            self, url_or_request, super()._request_webpage(url_or_request, *args, **kwargs),
+            logged_in)
 
     def _real_extract(self, url):
         username, story_id = self._match_valid_url(url).group('user', 'id')

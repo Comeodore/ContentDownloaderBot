@@ -295,7 +295,7 @@ async def _report_download_error(
     logger.info("Не скачалось для %s: %s — %s", _who(message), url, e)
     await status.edit_text(f"❌ {html.quote(str(e))}")
     if e.auth and _needs_cookies(url):
-        await _notify_owner_cookies(message.bot, config)
+        await _notify_owner_cookies(message.bot, config, url)
 
 
 async def _handle_full(message: Message, config: Config, url: str) -> None:
@@ -323,12 +323,6 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
                 return
             logger.info("Скачано для %s: %s — %d файл(ов), %.1f МБ", _who(message), url,
                         len(result.items), result.total_size / 1024 / 1024)
-
-            # Скачалось только без cookies — сессия негодна: владельцу стоит знать,
-            # иначе закрытые посты будут молча недоступны (см. _STALE_COOKIES_KEY).
-            if result.cookies_stale:
-                await _notify_owner_cookies(
-                    message.bot, config, stale_site=downloader.site_of(url))
 
             try:
                 await _send_media(message, result, url)
@@ -378,9 +372,6 @@ async def _handle_cut(
                 return
             logger.info("Нарезано для %s: %s — %d из %d клип(ов)", _who(message), url,
                         len(result.clips), len(ranges))
-            if result.cookies_stale:
-                await _notify_owner_cookies(
-                    message.bot, config, stale_site=downloader.site_of(url))
 
             vdur = result.duration
             sent = 0
@@ -508,20 +499,20 @@ async def _safe_edit(status: Message, text: str) -> None:
         pass
 
 
+# Площадки, где бот держит сессию в cookies.txt (их домен — в напоминании).
+_COOKIE_SITES = {"instagram": "instagram.com", "threads": "threads.com"}
+
+
 def _needs_cookies(url: str) -> bool:
     """Площадки, где логин-ошибка означает протухшие cookies, а не битую ссылку."""
-    return downloader.site_of(url) in ("instagram", "threads")
+    return downloader.site_of(url) in _COOKIE_SITES
 
 
-async def _notify_owner_cookies(
-    bot: Bot, config: Config, stale_site: str | None = None,
-) -> None:
+async def _notify_owner_cookies(bot: Bot, config: Config, url: str) -> None:
     """Сообщает владельцу о протухших cookies (не чаще раза в 6 часов).
 
-    stale_site — пост скачался только без сессии этой площадки (cookies_stale):
-    сессия не просто «не хватило прав», а негодна. Threads с ней не отдаёт даже
-    публичные посты; Instagram отправляет её на страницу логина, и закрытое
-    (приватные аккаунты, сторис) не качается, пока её не заменят.
+    Повод — ошибка доступа уже под сессией: гостем бот пробует первым и без
+    сессии в cookies.txt владельца не дёргает (см. downloader._extract_info).
     """
     if not config.owner_id:
         return
@@ -529,31 +520,14 @@ async def _notify_owner_cookies(
     if now - _last_cookie_notify["t"] < 6 * 3600:
         return
     _last_cookie_notify["t"] = now
+    domain = _COOKIE_SITES.get(downloader.site_of(url), "the site")
     text = (
-        "⚠️ Looks like the cookies expired (login required / rate limit).\n"
-        "Export cookies.txt for the site that failed — <b>instagram.com</b> or "
-        "<b>threads.com</b> — and send it here as a document. I merge it into "
+        f"⚠️ A <b>{domain}</b> link needed the saved session, and it didn't work "
+        "(login required / rate limit / expired session).\n"
+        f"Export cookies.txt for <b>{domain}</b> — from a secondary account, "
+        "not your main one — and send it here as a document. I merge it into "
         "the existing file, so the other sites keep working."
     )
-    if stale_site == "instagram":
-        text = (
-            "⚠️ The saved <b>instagram.com</b> session has expired: Instagram "
-            "sends it to the login page, so this post came through only as a "
-            "guest. Private accounts and stories won't download until it's "
-            "replaced.\n"
-            "Export cookies.txt for <b>instagram.com</b> (logged in, with "
-            "httpOnly cookies) and send it here as a document — I merge it into "
-            "the existing file, so the other sites keep working."
-        )
-    elif stale_site == "threads":
-        text = (
-            "⚠️ The saved <b>threads.com</b> session is being refused: this post "
-            "only came through after I dropped the cookies. While that session "
-            "sits in cookies.txt, Threads hides posts that need a login.\n"
-            "Export cookies.txt for <b>threads.com</b> (logged in, with httpOnly "
-            "cookies) and send it here as a document — I merge it into the "
-            "existing file, so the other sites keep working."
-        )
     try:
         await bot.send_message(config.owner_id, text)
     except Exception:  # noqa: BLE001
