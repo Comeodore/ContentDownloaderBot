@@ -145,7 +145,7 @@ class ThreadsIE(InfoExtractor):
     def _pk_from_code(code):
         try:
             return decode_base_n(code, table=_CODE_CHARS)
-        except ValueError:
+        except (ValueError, KeyError):  # KeyError: a character outside the alphabet
             return None
 
     def _api_post(self, video_id, pk=None):

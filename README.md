@@ -21,6 +21,15 @@ cp .env.example .env           # set BOT_TOKEN from @BotFather
 python bot.py
 ```
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Offline: no network, Telegram or real downloads.
+
 ## Configuration (`.env`)
 
 | Variable | Purpose |

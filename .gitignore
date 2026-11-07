@@ -8,3 +8,4 @@ downloads/
 *.log
 .claude/
 .DS_Store
+.pytest_cache/
