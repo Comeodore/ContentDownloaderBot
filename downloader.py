@@ -370,6 +370,19 @@ def _raw_error(e: Exception) -> str:
     return lines[-1].strip() if lines else ""
 
 
+def error_detail(e: BaseException | None) -> str | None:
+    """The cause behind an error: yt-dlp's raw text, or the exception's type and text."""
+    seen = set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if isinstance(e, yt_dlp.utils.DownloadError):
+            return _raw_error(e).removeprefix("ERROR: ")
+        if not isinstance(e, DownloadError):
+            return f"{type(e).__name__}: {_raw_error(e)}"
+        e = e.__cause__
+    return None
+
+
 def _cookies_name(site: str | None) -> str:
     """How errors name a site's cookies: "instagram.com cookies"."""
     return f"{_SITES[site][0]} cookies" if site in _SITES else "cookies for this site"

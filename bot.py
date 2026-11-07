@@ -272,12 +272,27 @@ def _who(message: Message) -> str:
     return str(message.from_user.id) if message.from_user else "?"
 
 
+_SOMETHING_WRONG = "Something went wrong while handling this link."
+
+
+def _log_failure(message: Message, url: str, shown: str, cause: str | None = None,
+                 exc_info: bool = False) -> None:
+    """One line per failure the user saw; the dashboard and the alert parse it.
+
+    Format: "Download failed for <user>: <url> — <what the user saw> | cause: <cause>".
+    """
+    line = f"Download failed for {_who(message)}: {url} — {shown}"
+    if cause and cause not in shown:
+        line += " | cause: " + " ".join(cause.split())
+    logger.log(logging.ERROR if exc_info else logging.INFO, line, exc_info=exc_info)
+
+
 async def _report_download_error(
     message: Message, status: Message, config: Config, url: str,
     e: downloader.DownloadError,
 ) -> None:
     """Logs a download error and shows it to the user."""
-    logger.info("Download failed for %s: %s — %s", _who(message), url, e)
+    _log_failure(message, url, str(e), downloader.error_detail(e))
     await status.edit_text(f"❌ {html.quote(str(e))}")
     if e.auth and _needs_cookies(url):
         await _notify_owner_cookies(message.bot, config, url)
@@ -298,11 +313,10 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
             except downloader.DownloadError as e:
                 await _report_download_error(message, status, config, url, e)
                 return
-            except Exception:  # noqa: BLE001
-                logger.exception("Unexpected error downloading %s", url)
-                await status.edit_text(
-                    "❌ Something went wrong while handling this link."
-                )
+            except Exception as e:  # noqa: BLE001
+                _log_failure(message, url, _SOMETHING_WRONG, downloader.error_detail(e),
+                             exc_info=True)
+                await status.edit_text("❌ " + _SOMETHING_WRONG)
                 return
             logger.info("Downloaded for %s: %s — %d file(s), %.1f MB", _who(message), url,
                         len(result.items), result.total_size / 1024 / 1024)
@@ -310,11 +324,10 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
             try:
                 await _send_media(message, result, url)
                 await status.delete()
-            except Exception:  # noqa: BLE001
-                logger.exception("Couldn't send media")
-                await status.edit_text(
-                    "❌ Downloaded it, but Telegram didn't accept the file."
-                )
+            except Exception as e:  # noqa: BLE001
+                shown = "Downloaded it, but Telegram didn't accept the file."
+                _log_failure(message, url, shown, downloader.error_detail(e), exc_info=True)
+                await status.edit_text("❌ " + shown)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -347,11 +360,10 @@ async def _handle_cut(
             except downloader.DownloadError as e:
                 await _report_download_error(message, status, config, url, e)
                 return
-            except Exception:  # noqa: BLE001
-                logger.exception("cut: couldn't download %s", url)
-                await status.edit_text(
-                    "❌ Something went wrong while handling this link."
-                )
+            except Exception as e:  # noqa: BLE001
+                _log_failure(message, url, _SOMETHING_WRONG, downloader.error_detail(e),
+                             exc_info=True)
+                await status.edit_text("❌ " + _SOMETHING_WRONG)
                 return
             logger.info("Cut for %s: %s — %d of %d clip(s)", _who(message), url,
                         len(result.clips), len(ranges))
@@ -368,6 +380,7 @@ async def _handle_cut(
                 clip = result.clips.get(i)
                 if clip is None:
                     error = result.errors.get(i, "couldn't process this piece")
+                    _log_failure(message, url, f"{label}: {error}")
                     await message.answer(f"❌ {label}: {html.quote(error)}")
                     continue
                 try:
@@ -380,8 +393,9 @@ async def _handle_cut(
                         supports_streaming=True,
                     )
                     sent += 1
-                except Exception:  # noqa: BLE001
-                    logger.exception("cut: couldn't send clip %s", label)
+                except Exception as e:  # noqa: BLE001
+                    _log_failure(message, url, f"{label}: Telegram didn't accept this clip",
+                                 downloader.error_detail(e), exc_info=True)
                     await message.answer(f"❌ {label}: Telegram didn't accept this clip")
 
             if sent:
