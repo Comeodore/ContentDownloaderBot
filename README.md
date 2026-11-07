@@ -46,7 +46,7 @@ Offline: no network, Telegram or real downloads.
 
 When a download fails for anyone, the owner gets a report: user, link, the bot's diagnosis and the raw cause. The user sees the reason only when it's theirs to deal with (deleted video, wrong link, size limit); otherwise a standard reply says the developer has been notified.
 
-The report's **🛠 Send to Claude** button (owner only) queues it in `claude-inbox/` on the data volume, where a Claude Code session picks it up; see `inbox.py`.
+A technical failure also goes straight to `claude-inbox/` on the data volume, where a Claude Code worker picks it up, fixes what it can and answers under the report (see `inbox.py`). The bot is public, so the same problem is sent at most once per 6 h and at most 10 a day. User-side failures and those over the limit get a **🛠 Send to Claude** button instead (owner only).
 
 ## 🐳 Deploy
 

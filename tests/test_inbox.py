@@ -37,6 +37,8 @@ def test_no_partial_files_in_the_inbox(config):
 def fresh_limits(monkeypatch):
     monkeypatch.setattr(bot, "_reported", {})
     monkeypatch.setattr(bot, "_report_times", [])
+    monkeypatch.setattr(bot, "_auto_sent", {})
+    monkeypatch.setattr(bot, "_auto_times", [])
 
 
 def test_same_failure_is_reported_once_per_window(fresh_limits):
@@ -92,3 +94,59 @@ def test_button_ignores_everyone_else(config):
     asyncio.run(bot.handle_send_to_claude(cb, cfg))
     assert inbox.pending(cfg) == []
     cb.message.edit_text.assert_not_awaited()
+
+
+IG = "https://www.instagram.com/p/DfR0xxWuoFm/"
+JSON_ERR = "Couldn't download it: [Instagram] DfR0xxWuoFm: Failed to parse JSON"
+
+
+def test_problem_key_ignores_ids_and_links():
+    other = bot._problem_key("https://www.instagram.com/p/Zz9/", JSON_ERR.replace("DfR0xxWuoFm", "Zz9"))
+    assert bot._problem_key(IG, JSON_ERR) == other
+    assert bot._problem_key(IG, JSON_ERR) != bot._problem_key("https://youtu.be/abcdefghijk", JSON_ERR)
+
+
+def test_same_problem_auto_sent_once_per_window(fresh_limits):
+    assert bot._should_auto_send(IG, JSON_ERR, 0.0)
+    assert not bot._should_auto_send(IG, JSON_ERR.replace("DfR0xxWuoFm", "Zz9"), 60.0)
+    assert bot._should_auto_send(IG, "Couldn't download it: something else", 60.0)
+    assert bot._should_auto_send(IG, JSON_ERR, bot._AUTO_SAME_PROBLEM_AFTER + 1)
+
+
+def test_auto_sessions_per_day_are_capped(fresh_limits):
+    sent = [bot._should_auto_send(IG, f"error kind {chr(97 + i)}", 10.0 + i) for i in range(15)]
+    assert sent.count(True) == bot._AUTO_PER_DAY
+
+
+def _user_message():
+    sent = SimpleNamespace(chat=SimpleNamespace(id=1), message_id=5, text="❌ Download failed …")
+    tg = SimpleNamespace(send_message=AsyncMock(return_value=sent))
+    return SimpleNamespace(from_user=SimpleNamespace(id=42, username=None), bot=tg)
+
+
+def test_technical_failure_goes_to_claude_without_a_button(config, fresh_limits):
+    cfg, msg = config(), _user_message()
+    asyncio.run(bot._failure(msg, cfg, IG, JSON_ERR, "raw cause"))
+    args, kwargs = msg.bot.send_message.await_args
+    assert args[0] == cfg.owner_id and "Sent to Claude automatically" in args[1]
+    assert kwargs["reply_markup"] is None
+    [req] = inbox.pending(cfg)
+    assert (req["chat_id"], req["message_id"]) == (1, 5)
+
+
+def test_user_side_failure_is_only_reported(config, fresh_limits):
+    cfg, msg = config(), _user_message()
+    asyncio.run(bot._failure(msg, cfg, IG, "This video is no longer available — deleted or private.",
+                             user_side=True))
+    args, kwargs = msg.bot.send_message.await_args
+    assert "user's side" in args[1] and kwargs["reply_markup"] is not None
+    assert inbox.pending(cfg) == []
+
+
+def test_over_the_limit_the_report_keeps_the_button(config, fresh_limits, monkeypatch):
+    monkeypatch.setattr(bot, "_AUTO_PER_DAY", 0)
+    cfg, msg = config(), _user_message()
+    asyncio.run(bot._failure(msg, cfg, IG, JSON_ERR))
+    args, kwargs = msg.bot.send_message.await_args
+    assert "limit reached" in args[1] and kwargs["reply_markup"] is not None
+    assert inbox.pending(cfg) == []

@@ -308,6 +308,13 @@ _reported: dict[tuple[str, str], float] = {}
 _report_times: list[float] = []
 # callback_data of the button under a report.
 _CLAUDE_BUTTON = "claude"
+# Technical failures go to Claude's queue straight away. The bot is public, so anyone
+# can trigger that with broken links: one session per problem every 6 h, at most 10 a
+# day; beyond that the report keeps the button.
+_AUTO_SAME_PROBLEM_AFTER = 6 * 3600
+_AUTO_PER_DAY = 10
+_auto_sent: dict[str, float] = {}
+_auto_times: list[float] = []
 
 
 def _should_report(url: str, error: str, now: float) -> bool:
@@ -319,6 +326,25 @@ def _should_report(url: str, error: str, now: float) -> bool:
         return False
     _reported[(url, error)] = now
     _report_times.append(now)
+    return True
+
+
+def _problem_key(url: str, error: str) -> str:
+    """The site and the error without ids and numbers: one session per problem."""
+    text = re.sub(r"https?://\S+|\b\w*\d\w*\b", "", error.lower())
+    return f"{downloader.site_of(url)}: {' '.join(text.split())[:120]}"
+
+
+def _should_auto_send(url: str, error: str, now: float) -> bool:
+    for key, t in list(_auto_sent.items()):
+        if now - t >= _AUTO_SAME_PROBLEM_AFTER:
+            del _auto_sent[key]
+    _auto_times[:] = [t for t in _auto_times if now - t < 86400]
+    key = _problem_key(url, error)
+    if key in _auto_sent or len(_auto_times) >= _AUTO_PER_DAY:
+        return False
+    _auto_sent[key] = now
+    _auto_times.append(now)
     return True
 
 
@@ -337,19 +363,40 @@ def _failure_report(message: Message, url: str, error: str, cause: str | None) -
 
 
 async def _failure(message: Message, config: Config, url: str, error: str,
-                   cause: str | None = None, exc_info: bool = False) -> None:
-    """Logs a failure the user saw and reports it to the owner with a Send to Claude button."""
+                   cause: str | None = None, exc_info: bool = False,
+                   user_side: bool = False) -> None:
+    """Logs a failure the user saw and reports it to the owner.
+
+    A technical failure also goes to Claude's queue at once (within the limits above),
+    and Claude answers under the report; the rest get a Send to Claude button.
+    """
     _log_failure(message, url, error, cause, exc_info=exc_info)
-    if not config.owner_id or not _should_report(url, error, time.monotonic()):
+    now = time.monotonic()
+    if not config.owner_id or not _should_report(url, error, now):
         return
+    auto = not user_side and _should_auto_send(url, error, now)
+    text = _failure_report(message, url, error, cause)
+    if auto:
+        text += "\n\n🤖 <i>Sent to Claude automatically</i>"
+    elif user_side:
+        text += "\n\nℹ️ <i>The user's side, nothing to fix</i>"
+    else:
+        text += "\n\n⏸ <i>Auto-send limit reached</i>"
+    button = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🛠 Send to Claude", callback_data=_CLAUDE_BUTTON)]])
     try:
-        await message.bot.send_message(
-            config.owner_id, _failure_report(message, url, error, cause),
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🛠 Send to Claude", callback_data=_CLAUDE_BUTTON)]]))
+        sent = await message.bot.send_message(
+            config.owner_id, text, link_preview_options=LinkPreviewOptions(is_disabled=True),
+            reply_markup=None if auto else button)
     except Exception:  # noqa: BLE001
         logger.exception("Couldn't send the failure report")
+        return
+    if auto:
+        try:
+            logger.info("Report queued for Claude: %s",
+                        inbox.add(config, sent.chat.id, sent.message_id, sent.text or text))
+        except OSError:
+            logger.exception("Couldn't queue the report for Claude")
 
 
 @dp.callback_query(F.data == _CLAUDE_BUTTON)
@@ -377,7 +424,8 @@ async def _report_download_error(
     e: downloader.DownloadError,
 ) -> None:
     """Logs a download error, reports it to the owner and shows it to the user."""
-    await _failure(message, config, url, str(e), downloader.error_detail(e))
+    await _failure(message, config, url, str(e), downloader.error_detail(e),
+                   user_side=e.user_side)
     await status.edit_text(f"❌ {html.quote(_user_text(e))}")
     if e.auth and _needs_cookies(url):
         await _notify_owner_cookies(message.bot, config, url)
@@ -466,7 +514,8 @@ async def _handle_cut(
                 if clip is None:
                     error = (result.errors.get(i)
                              or downloader.DownloadError("couldn't process this piece"))
-                    await _failure(message, config, url, f"{label}: {error}")
+                    await _failure(message, config, url, f"{label}: {error}",
+                                   user_side=error.user_side)
                     text = str(error) if error.user_side else f"{error}. {_NOTIFIED}"
                     await message.answer(f"❌ {label}: {html.quote(text)}")
                     continue
