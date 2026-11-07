@@ -119,8 +119,7 @@ async def handle_cookies_upload(message: Message, config: Config) -> None:
             return
         os.chmod(config.cookies_file, 0o600)
         await message.answer("✅ Cookies updated for: " + html.quote(", ".join(domains)))
-        logger.info("Cookies updated by owner %s: %s",
-                    message.from_user.id, ", ".join(domains))
+        logger.info("Cookies updated by owner %s: %s", _who(message), ", ".join(domains))
     except Exception:  # noqa: BLE001
         logger.exception("Couldn't save cookies")
         await message.answer("❌ Couldn't save the cookies — check the bot logs.")
@@ -274,7 +273,12 @@ async def _job(status: Message, working_text: str):
 
 
 def _who(message: Message) -> str:
-    return str(message.from_user.id) if message.from_user else "?"
+    """The user's id and @username for the logs: "42 @bob", or "42" without a username."""
+    user = message.from_user
+    if not user:
+        return "?"
+    username = getattr(user, "username", None)
+    return f"{user.id} @{username}" if username else str(user.id)
 
 
 # For failures the developer has to fix: every failure is reported to the owner.
@@ -289,10 +293,10 @@ def _user_text(e: downloader.DownloadError) -> str:
 
 def _log_failure(message: Message, url: str, error: str, cause: str | None = None,
                  exc_info: bool = False) -> None:
-    """One line per failure the user saw; the dashboard and the alert parse it.
+    """One line per failure the user saw; the Grafana dashboard parses it.
 
-    Format: "Download failed for <user>: <url> — <error> | cause: <cause>", where error
-    is the bot's diagnosis and cause the raw yt-dlp text or exception.
+    Format: "Download failed for <id> [@username]: <url> — <error> | cause: <cause>",
+    where error is the bot's diagnosis and cause the raw yt-dlp text or exception.
     """
     line = f"Download failed for {_who(message)}: {url} — {error}"
     if cause and cause not in error:

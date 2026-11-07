@@ -9,10 +9,11 @@ import yt_dlp
 import bot
 import downloader
 
-# Same pattern as the regexp in the Grafana alert contentdl_download_failed
-# (/opt/monitoring/grafana/provisioning/alerting/rules.yml). Keep them in sync.
+# The line as the Grafana dashboard parses it (the "Users" and "Failure reasons" regexps in
+# /opt/monitoring/grafana/dashboards/services/contentdl-bot.json). Keep them in sync.
 ALERT_RE = re.compile(
-    r"Download failed for (?P<user>\S+): (?P<url>\S+) — (?P<error>[^|]*[^| ])(?: \| cause: (?P<cause>.+))?")
+    r"Download failed for (?P<user>\d+|\?)(?: @(?P<tag>\w+))?: (?P<url>\S+)"
+    r" — (?P<error>[^|]*[^| ])(?: \| cause: (?P<cause>.+))?")
 
 URL = "https://www.instagram.com/p/abc/?a=1&b=2"
 MSG = SimpleNamespace(from_user=SimpleNamespace(id=42))
@@ -119,3 +120,16 @@ def test_user_side_errors(raw, user_side):
 def test_standard_reply_says_the_developer_knows():
     assert "developer has already been notified" in bot._STANDARD_ERROR
     assert bot._user_text(downloader.DownloadError("Cookie problem: x")) == bot._STANDARD_ERROR
+
+
+def test_username_follows_the_id(caplog):
+    msg = SimpleNamespace(from_user=SimpleNamespace(id=42, username="bob_1"))
+    with caplog.at_level(logging.INFO, logger="videobot"):
+        bot._log_failure(msg, URL, "boom")
+    m = ALERT_RE.search(caplog.records[-1].getMessage())
+    assert (m.group("user"), m.group("tag"), m.group("url")) == ("42", "bob_1", URL)
+
+
+def test_who_without_username_or_user():
+    assert bot._who(SimpleNamespace(from_user=SimpleNamespace(id=42, username=None))) == "42"
+    assert bot._who(SimpleNamespace(from_user=None)) == "?"
