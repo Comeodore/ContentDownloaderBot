@@ -27,13 +27,18 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import (
+    CallbackQuery,
     FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InputMediaPhoto,
     InputMediaVideo,
+    LinkPreviewOptions,
     Message,
 )
 
 import downloader
+import inbox
 from config import Config, load_config
 from heartbeat import beat
 
@@ -272,7 +277,7 @@ def _who(message: Message) -> str:
     return str(message.from_user.id) if message.from_user else "?"
 
 
-# For failures the developer has to fix: every failure reaches them as an alert.
+# For failures the developer has to fix: every failure is reported to the owner.
 _NOTIFIED = "The developer has already been notified."
 _STANDARD_ERROR = "Couldn't download this — something went wrong on my side. " + _NOTIFIED
 
@@ -295,12 +300,84 @@ def _log_failure(message: Message, url: str, error: str, cause: str | None = Non
     logger.log(logging.ERROR if exc_info else logging.INFO, line, exc_info=exc_info)
 
 
+# Failure reports to the owner: the same failure at most every 10 min, and at most
+# 20 reports an hour, so a stream of broken links from strangers can't flood them.
+_REPORT_REPEAT_AFTER = 600
+_REPORTS_PER_HOUR = 20
+_reported: dict[tuple[str, str], float] = {}
+_report_times: list[float] = []
+# callback_data of the button under a report.
+_CLAUDE_BUTTON = "claude"
+
+
+def _should_report(url: str, error: str, now: float) -> bool:
+    for key, t in list(_reported.items()):
+        if now - t >= _REPORT_REPEAT_AFTER:
+            del _reported[key]
+    _report_times[:] = [t for t in _report_times if now - t < 3600]
+    if (url, error) in _reported or len(_report_times) >= _REPORTS_PER_HOUR:
+        return False
+    _reported[(url, error)] = now
+    _report_times.append(now)
+    return True
+
+
+def _failure_report(message: Message, url: str, error: str, cause: str | None) -> str:
+    user = message.from_user
+    who = "?"
+    if user:
+        who = f"{user.id} (@{user.username})" if user.username else str(user.id)
+    lines = ["❌ <b>Download failed</b>",
+             f"<b>User:</b> {html.quote(who)}",
+             f"<b>Link:</b> {html.quote(url)}",
+             f"<b>Error:</b> {html.quote(error)}"]
+    if cause and cause not in error:
+        lines.append(f"<b>Cause:</b> <code>{html.quote(' '.join(cause.split())[:1500])}</code>")
+    return "\n".join(lines)
+
+
+async def _failure(message: Message, config: Config, url: str, error: str,
+                   cause: str | None = None, exc_info: bool = False) -> None:
+    """Logs a failure the user saw and reports it to the owner with a Send to Claude button."""
+    _log_failure(message, url, error, cause, exc_info=exc_info)
+    if not config.owner_id or not _should_report(url, error, time.monotonic()):
+        return
+    try:
+        await message.bot.send_message(
+            config.owner_id, _failure_report(message, url, error, cause),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🛠 Send to Claude", callback_data=_CLAUDE_BUTTON)]]))
+    except Exception:  # noqa: BLE001
+        logger.exception("Couldn't send the failure report")
+
+
+@dp.callback_query(F.data == _CLAUDE_BUTTON)
+async def handle_send_to_claude(callback: CallbackQuery, config: Config) -> None:
+    """The owner queues a failure report for Claude; the button works only for them."""
+    msg = callback.message
+    if (not config.owner_id or callback.from_user.id != config.owner_id
+            or not isinstance(msg, Message) or not msg.text):
+        await callback.answer()
+        return
+    try:
+        rid = inbox.add(config, msg.chat.id, msg.message_id, msg.text)
+    except OSError:
+        logger.exception("Couldn't queue the report for Claude")
+        await callback.answer("Couldn't queue it, see the bot logs.", show_alert=True)
+        return
+    logger.info("Report queued for Claude: %s", rid)
+    await msg.edit_text(msg.html_text + "\n\n📨 <i>Sent to Claude</i>",
+                        link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await callback.answer("Sent to Claude")
+
+
 async def _report_download_error(
     message: Message, status: Message, config: Config, url: str,
     e: downloader.DownloadError,
 ) -> None:
-    """Logs a download error and shows it to the user."""
-    _log_failure(message, url, str(e), downloader.error_detail(e))
+    """Logs a download error, reports it to the owner and shows it to the user."""
+    await _failure(message, config, url, str(e), downloader.error_detail(e))
     await status.edit_text(f"❌ {html.quote(_user_text(e))}")
     if e.auth and _needs_cookies(url):
         await _notify_owner_cookies(message.bot, config, url)
@@ -322,8 +399,8 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
                 await _report_download_error(message, status, config, url, e)
                 return
             except Exception as e:  # noqa: BLE001
-                _log_failure(message, url, "Unexpected error", downloader.error_detail(e),
-                             exc_info=True)
+                await _failure(message, config, url, "Unexpected error",
+                               downloader.error_detail(e), exc_info=True)
                 await status.edit_text("❌ " + _STANDARD_ERROR)
                 return
             logger.info("Downloaded for %s: %s — %d file(s), %.1f MB", _who(message), url,
@@ -333,8 +410,8 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
                 await _send_media(message, result, url)
                 await status.delete()
             except Exception as e:  # noqa: BLE001
-                _log_failure(message, url, "Telegram didn't accept the file",
-                             downloader.error_detail(e), exc_info=True)
+                await _failure(message, config, url, "Telegram didn't accept the file",
+                               downloader.error_detail(e), exc_info=True)
                 await status.edit_text("❌ " + _STANDARD_ERROR)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -369,8 +446,8 @@ async def _handle_cut(
                 await _report_download_error(message, status, config, url, e)
                 return
             except Exception as e:  # noqa: BLE001
-                _log_failure(message, url, "Unexpected error", downloader.error_detail(e),
-                             exc_info=True)
+                await _failure(message, config, url, "Unexpected error",
+                               downloader.error_detail(e), exc_info=True)
                 await status.edit_text("❌ " + _STANDARD_ERROR)
                 return
             logger.info("Cut for %s: %s — %d of %d clip(s)", _who(message), url,
@@ -389,7 +466,7 @@ async def _handle_cut(
                 if clip is None:
                     error = (result.errors.get(i)
                              or downloader.DownloadError("couldn't process this piece"))
-                    _log_failure(message, url, f"{label}: {error}")
+                    await _failure(message, config, url, f"{label}: {error}")
                     text = str(error) if error.user_side else f"{error}. {_NOTIFIED}"
                     await message.answer(f"❌ {label}: {html.quote(text)}")
                     continue
@@ -404,8 +481,9 @@ async def _handle_cut(
                     )
                     sent += 1
                 except Exception as e:  # noqa: BLE001
-                    _log_failure(message, url, f"{label}: Telegram didn't accept this clip",
-                                 downloader.error_detail(e), exc_info=True)
+                    await _failure(message, config, url,
+                                   f"{label}: Telegram didn't accept this clip",
+                                   downloader.error_detail(e), exc_info=True)
                     await message.answer(
                         f"❌ {label}: Telegram didn't accept this clip. {_NOTIFIED}")
 

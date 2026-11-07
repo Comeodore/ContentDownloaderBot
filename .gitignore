@@ -9,3 +9,4 @@ downloads/
 .claude/
 .DS_Store
 .pytest_cache/
+claude-inbox/

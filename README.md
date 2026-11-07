@@ -37,10 +37,16 @@ Offline: no network, Telegram or real downloads.
 | `BOT_TOKEN` | token from [@BotFather](https://t.me/BotFather) (required) |
 | `MAX_FILE_SIZE_MB` | file size limit: `49` without a local server, up to `1900` with one |
 | `COOKIES_FILE` | path to `cookies.txt` (logged-in sessions, see below) |
-| `OWNER_ID` | owner's Telegram id: uploads cookies, gets cookie reminders |
+| `OWNER_ID` | owner's Telegram id: uploads cookies, gets failure reports and cookie reminders |
 | `YTDLP_AUTO_UPDATE_HOURS` | restart period to update yt-dlp (`0` = off) |
 | `TELEGRAM_API_BASE` | local Bot API server URL, for files up to 2 GB |
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | from my.telegram.org, local server only |
+
+## Failure reports
+
+When a download fails for anyone, the owner gets a report: user, link, the bot's diagnosis and the raw cause. The user sees the reason only when it's theirs to deal with (deleted video, wrong link, size limit); otherwise a standard reply says the developer has been notified.
+
+The report's **🛠 Send to Claude** button (owner only) queues it in `claude-inbox/` on the data volume, where a Claude Code session picks it up; see `inbox.py`.
 
 ## 🐳 Deploy
 
