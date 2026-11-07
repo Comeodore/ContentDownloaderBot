@@ -1,164 +1,94 @@
 # 📥 Content Downloader
 
-Телеграм-бот: присылаешь ссылку — получаешь видео.
-Поддержка **TikTok (без вотермарки)**, **YouTube Shorts**, **Instagram Reels**, **Threads**.
+Telegram bot: send a link, get the video or photos back.
 
-Стек: [aiogram 3](https://aiogram.dev/) (async) + [yt-dlp](https://github.com/yt-dlp/yt-dlp) + ffmpeg.
+- **TikTok**: videos without watermark, photo slideshows with their music
+- **Instagram**: reels, posts, carousels, stories
+- **YouTube**: Shorts, videos, clips
+- **Threads**: videos, photos, carousels
 
-## Как работает без вотермарки на TikTok
+Timecodes after a link (`<link> 1:00-1:10, 2:10-2:55`) cut clips.
 
-TikTok отдаёт **оригинал без вотермарки** на часть CDN-эндпоинтов — watermark
-накладывается позже, при выдаче в приложение/веб-плеер. yt-dlp забирает поток
-до этого шага, поэтому TikTok качается чистым по умолчанию, без доп. настроек.
+Stack: [aiogram 3](https://aiogram.dev/), [yt-dlp](https://github.com/yt-dlp/yt-dlp), ffmpeg. TikTok comes without a watermark by default: yt-dlp takes the stream before the watermark is applied.
 
-## Установка
+## Running locally
 
 ```bash
-# 1. ffmpeg (нужен для склейки видео+аудио)
-brew install ffmpeg          # macOS
-# sudo apt install ffmpeg    # Debian/Ubuntu
-
-# 2. зависимости
-python3 -m venv .venv
-source .venv/bin/activate
+brew install ffmpeg            # or: sudo apt install ffmpeg
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# 3. конфиг
-cp .env.example .env
-# впиши BOT_TOKEN от @BotFather
-```
-
-## Запуск
-
-```bash
-source .venv/bin/activate
+cp .env.example .env           # set BOT_TOKEN from @BotFather
 python bot.py
 ```
 
-Открой бота в Telegram, нажми `/start`, кинь ссылку.
+## Configuration (`.env`)
 
-## Конфигурация (`.env`)
-
-| Переменная | Назначение |
+| Variable | Purpose |
 |---|---|
-| `BOT_TOKEN` | токен от [@BotFather](https://t.me/BotFather) (обязательно) |
-| `MAX_FILE_SIZE_MB` | лимит размера файла (`49` без локального сервера, до `1900` с ним) |
-| `COOKIES_FILE` | путь к `cookies.txt` для Instagram / приватного контента |
-| `YTDLP_AUTO_UPDATE_HOURS` | период самоперезапуска ради обновления yt-dlp (`0` = выкл) |
-| `TELEGRAM_API_BASE` | URL локального Bot API server для файлов до 2 ГБ |
-| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | креды с my.telegram.org — **только для локального сервера** |
+| `BOT_TOKEN` | token from [@BotFather](https://t.me/BotFather) (required) |
+| `MAX_FILE_SIZE_MB` | file size limit: `49` without a local server, up to `1900` with one |
+| `COOKIES_FILE` | path to `cookies.txt` (logged-in sessions, see below) |
+| `OWNER_ID` | owner's Telegram id: uploads cookies, gets cookie reminders |
+| `YTDLP_AUTO_UPDATE_HOURS` | restart period to update yt-dlp (`0` = off) |
+| `TELEGRAM_API_BASE` | local Bot API server URL, for files up to 2 GB |
+| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | from my.telegram.org, local server only |
 
-## 🐳 Деплой
+## 🐳 Deploy
 
-Два сервиса: бот и локальный Bot API server (файлы до 2 ГБ). Сейчас крутится на
-хосте `ubuntu` (192.168.0.185, SSD): код — `/root/contentdl-bot`, данные —
-`/root/contentdl-data`.
+Two services: the bot and a local Bot API server. The official Bot API caps bot uploads at 50 MB; the local server ([`aiogram/telegram-bot-api`](https://github.com/aiogram/telegram-bot-api) in `--local` mode) raises it to 2 GB and takes files by path.
 
-Все данные (скачанные видео + данные Bot API server) живут в одном каталоге —
-`CONTENTDL_DATA_DIR` из `.env` (по умолчанию `./data`). Он монтируется в **оба**
-контейнера по одному пути `/var/lib/telegram-bot-api`, иначе path-режим сервера
-не найдёт файлы бота. Постоянного там всего ~100 КБ (`cookies.txt` + состояние
-Bot API server), видео — только на время отправки, но на пике до ~10 ГБ
-(3 задачи × до 1.9 ГБ, при склейке файл лежит дважды).
+Currently on host `ubuntu` (192.168.0.185): code in `/root/contentdl-bot`, data in `/root/contentdl-data`.
 
-Каталог данных держи **вне** каталога с кодом: `.dockerignore` исключает только
-корневые `downloads/` и `cookies.txt`, а `data/cookies.txt` через `COPY . .`
-уехал бы в образ.
-ffmpeg в образе — **отдельный бинарь** (сборки [BtbN](https://github.com/BtbN/FFmpeg-Builds),
-не apt), чтобы не раздувать образ; вариант `gpl` — в нём нужный боту libx264.
+`CONTENTDL_DATA_DIR` is mounted into **both** containers at `/var/lib/telegram-bot-api`, or path mode can't find the files. It holds `cookies.txt` and server state (~100 KB) plus downloads while they're sent (up to ~10 GB at peak). Keep it **outside** the code dir: `COPY . .` would put `data/cookies.txt` into the image.
 
-### Первый деплой
+First deploy:
 
 ```bash
-# на хосте: каталог данных с владельцем uid 101 (= юзер telegram-bot-api)
+# data dir owned by uid 101 (the telegram-bot-api user)
 ssh root@YOUR_SERVER 'mkdir -p /path/to/contentdl-data/downloads && chown -R 101:101 /path/to/contentdl-data'
-
-# .env на хосте: BOT_TOKEN, TELEGRAM_API_ID/HASH, MAX_FILE_SIZE_MB=1900,
-#                CONTENTDL_DATA_DIR=/path/to/contentdl-data
-# залить код (если на хосте нет rsync — scp/tar):
-tar czf - --exclude=.git --exclude=.venv --exclude=.env . | ssh root@YOUR_SERVER 'tar xzf - -C /path/to/contentdl-bot'
-
+# .env on the host: BOT_TOKEN, TELEGRAM_API_ID/HASH, MAX_FILE_SIZE_MB=1900, CONTENTDL_DATA_DIR
+COPYFILE_DISABLE=1 tar czf - --exclude=.git --exclude=.venv --exclude=.env . | ssh root@YOUR_SERVER 'tar xzf - -C /path/to/contentdl-bot'
 ssh root@YOUR_SERVER 'cd /path/to/contentdl-bot && docker compose up -d --build'
 ```
 
-### Передеплой после правок кода
+After code changes:
 
 ```bash
 scp -r bot.py downloader.py config.py yt_dlp_plugins root@YOUR_SERVER:/path/to/contentdl-bot/
 ssh root@YOUR_SERVER 'cd /path/to/contentdl-bot && docker compose up -d --build bot'
 ```
 
-### Полезное
+Logs: `docker compose logs -f bot`.
 
-```bash
-ssh root@YOUR_SERVER 'cd /path/to/contentdl-bot && docker compose logs -f bot'   # логи
-ssh root@YOUR_SERVER 'cd /path/to/contentdl-bot && docker compose ps'            # статус
-```
+### Updates
 
-## 🔄 Авто-обновление (двухуровневое)
+- **yt-dlp**: `entrypoint.sh` installs the latest nightly on every start, and the bot restarts itself every `YTDLP_AUTO_UPDATE_HOURS` (24 h by default) once idle.
+- **Bot API server**: the host's shared Watchtower pulls new images. The stack has no Watchtower of its own: a second unscoped instance stops and removes the first. On a host without one, add it.
+- **Bot image**: built locally, updated by rebuilding.
 
-| Что | Механизм |
-|---|---|
-| **yt-dlp** (ломается чаще всего) | `entrypoint.sh` делает `pip install -U --pre yt-dlp` при каждом старте + бот сам перезапускается раз в `YTDLP_AUTO_UPDATE_HOURS` (по умолч. 24 ч) через `SIGTERM` → Docker поднимает заново → свежий yt-dlp |
-| **telegram-bot-api server** | общий Watchtower хоста раз в сутки тянет новый образ из registry |
+## Cookies for Instagram and Threads
 
-> Своего Watchtower в стеке нет: на `ubuntu` уже работает общий
-> (`/root/docker-compose.yml`), и `contentdl-bot-api-1` вписан в его список
-> контейнеров. Второй экземпляр без scope при старте останавливает и удаляет
-> первый — проверено на себе. На новом хосте без Watchtower — добавь туда свой.
->
-> Образ бота собирается локально, поэтому Watchtower его не трогает — yt-dlp
-> внутри обновляется сам (см. выше), а базовый образ/код — пересборкой.
+Instagram and Threads are fetched **as a guest first**: public posts, reels and carousels need no login. The session from `cookies.txt` is used only for what guests don't get: stories, private accounts, posts hidden from logged-out visitors. Without it those links fail with "Cookie problem: …", and the owner isn't notified.
 
-## Лимит размера файла
+To add a session:
 
-Официальный Telegram Bot API **не даёт боту отправлять файлы больше 50 МБ**.
-Shorts / TikTok / Reels почти всегда меньше, поэтому без локального сервера хватает.
+1. Install the **Get cookies.txt LOCALLY** browser extension.
+2. Log in to Instagram, or to threads.com for Threads (Instagram cookies don't work there).
+3. Export **only the current site**, not all cookies: the bot replaces every site found in the file.
+4. Send the file to the bot as a document (owner only); it's merged into the existing one.
 
-**Локальный Bot API server** (поднимается в `docker-compose.yml`) снимает лимит
-до **2 ГБ**. Как это работает:
+If a link fails under the session too, the user sees "Cookie problem: the saved … cookies …" and the owner is asked for fresh cookies.
 
-- сервис `telegram-bot-api` (образ [`aiogram/telegram-bot-api`](https://github.com/aiogram/telegram-bot-api))
-  запускается в `--local` режиме рядом с ботом;
-- боту передаётся `TELEGRAM_API_BASE=http://telegram-bot-api:8081`, и aiogram
-  шлёт запросы туда вместо `api.telegram.org`;
-- серверу нужны **api_id / api_hash** с [my.telegram.org](https://my.telegram.org)
-  (это креды Telegram-приложения, не путать с токеном бота);
-- после этого `MAX_FILE_SIZE_MB` можно поднять до `1900`.
+> ⚠️ Use a secondary account only. The bot is public and Instagram counts every session request against the account: in 2026-11 the account all links went through was locked for automated activity.
 
-Без Docker можно запустить сервер вручную и указать его URL в `TELEGRAM_API_BASE`.
-
-## Cookies для Instagram и Threads
-
-Instagram и Threads бот качает **сначала гостем**: публичные посты, рилсы и
-карусели отдаются без логина. Сессия из `cookies.txt` нужна только для того,
-что гостю не отдают: сторис, закрытые аккаунты, посты, скрытые от гостей.
-Без cookies такие ссылки не качаются: пользователь видит «Cookie problem: …
-the bot has no instagram.com cookies», а владельцу бот не пишет.
-
-Если сессия нужна:
-
-1. Поставь в браузер расширение **«Get cookies.txt LOCALLY»**.
-2. Залогинься в Instagram (или Threads), экспортируй `cookies.txt`.
-3. Пришли его боту документом (бот вольёт его в общий файл) или положи рядом
-   с ботом и укажи путь в `COOKIES_FILE`.
-
-Если ссылка не скачалась и под сессией из-за логина, пользователь видит
-«Cookie problem: the saved … cookies …», а бот пишет владельцу: сессия
-протухла, пришли свежий `cookies.txt`.
-
-> ⚠️ Только второстепенный аккаунт. Бот открыт всем, и запросы под сессией
-> Instagram засчитывает аккаунту: в 2026-11 аккаунт, через который шли все
-> ссылки, залочили за автоматическую активность.
-
-## Структура
+## Layout
 
 ```
-bot.py                — хендлеры aiogram, polling, плановый self-restart
-downloader.py         — обёртка yt-dlp (детекция ссылок, скачивание, лимиты)
-config.py             — загрузка .env
-yt_dlp_plugins/       — плагины yt-dlp (экстрактор Threads, пока его нет в апстриме)
-Dockerfile            — образ бота (python + ffmpeg)
-docker/entrypoint.sh  — апдейт yt-dlp при старте → запуск бота
-docker-compose.yml    — бот + локальный Bot API server + Watchtower
+bot.py                — aiogram handlers, polling, scheduled restart
+downloader.py         — yt-dlp wrapper: link checks, download, limits
+config.py             — .env loading
+yt_dlp_plugins/       — yt-dlp plugins: Threads, Instagram photos/stories, TikTok photos
+Dockerfile            — bot image (python + ffmpeg)
+docker/entrypoint.sh  — yt-dlp update on start, then the bot
+docker-compose.yml    — bot + local Bot API server
 ```
