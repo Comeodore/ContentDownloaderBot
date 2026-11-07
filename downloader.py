@@ -116,8 +116,11 @@ class DownloadResult:
 
 
 class DownloadError(Exception):
-    """Download error; the message is shown to the user.
+    """Download error; the message names the cause.
 
+    user_side: the cause is the user's to deal with (deleted post, wrong link, size
+        limit), so the bot shows the message. Otherwise the user gets a standard
+        "developer notified" reply and the message goes to the log and the alert.
     auth: the site's saved cookies didn't work, so the owner gets a reminder.
         Not set when the bot has no cookies for the site at all.
     no_post: the post page wasn't served (redirect home, empty shell, 404).
@@ -128,8 +131,9 @@ class DownloadError(Exception):
     """
 
     def __init__(self, message: str, auth: bool = False, no_post: bool = False,
-                 no_media: bool = False, waf: bool = False) -> None:
+                 no_media: bool = False, waf: bool = False, user_side: bool = False) -> None:
         super().__init__(message)
+        self.user_side = user_side
         self.auth = auth
         self.no_post = no_post
         self.no_media = no_media
@@ -326,41 +330,42 @@ _NO_MEDIA_MARKERS = ("has no photo or video",)
 # The TikTok extractor's failure on a WAF stub or JS challenge.
 _WAF_MARKERS = ("unexpected response from webpage request", "challenge")
 
-# (markers in yt-dlp's text) → message. First match wins: specific cases first.
+# (markers in yt-dlp's text, message, user_side). First match wins: specific cases first.
 _ERROR_MESSAGES = (
     # The Threads plugin's own messages.
     (("quoted post holding the media",),
      "This post quotes another one, and that post is unavailable — "
-     "deleted, or not shown to logged-out visitors."),
+     "deleted, or not shown to logged-out visitors.", False),
     (("hidden from logged-out", "could not find post data"),
      "The site didn't hand over this post — it's deleted, "
-     "or visible only to logged-in users."),
+     "or visible only to logged-in users.", False),
     (("has no photo or video",),
-     "This post is text only — no photo or video in it."),
+     "This post is text only — no photo or video in it.", True),
     # Our Instagram plugin: the story expired (24 h). Not a login error.
     (("instagram story is gone",),
      "This story is no longer available — stories disappear after 24 hours, "
-     "and deleted ones or ones from private accounts can't be downloaded."),
+     "and deleted ones or ones from private accounts can't be downloaded.", True),
     # Lives YouTube won't serve: no recording yet, upcoming premiere.
     (("live stream recording is not available", "live event will begin", "premieres in"),
-     _LIVE_MESSAGE),
+     _LIVE_MESSAGE, True),
     (("unsupported url", "no suitable extractor"),
-     "This link doesn't point to a video or a post."),
+     "This link doesn't point to a video or a post.", True),
     (("blocked from accessing", "ip address is blocked"),
-     "The site is blocking this server's IP address."),
-    (("not available in your country", "geo restriction", "geo-restricted"),
-     "This video isn't available in the country where the bot runs."),
+     "The site is blocking this server's IP address.", False),
+    # YouTube: "The uploader has not made this video available in your country".
+    (("available in your country", "geo restriction", "geo-restricted"),
+     "This video isn't available in the country where the bot runs.", True),
     (("is unavailable", "has been removed", "no longer available",
       "video not found", "does not exist"),
-     "This video is no longer available — deleted or private."),
+     "This video is no longer available — deleted or private.", True),
     (("requested format", "no video formats", "no formats found"),
-     "No downloadable video or photo in this post."),
+     "No downloadable video or photo in this post.", False),
     (("http error 4", "http error 5", "unable to download video data",
       "forbidden"),
-     "The site refused to hand over the file."),
+     "The site refused to hand over the file.", False),
     (("timed out", "timeout", "unable to connect", "connection reset",
       "temporary failure in name resolution"),
-     "The site didn't respond in time."),
+     "The site didn't respond in time.", False),
 )
 
 
@@ -412,9 +417,10 @@ def _as_download_error(e: Exception, site: str | None = None) -> DownloadError:
             "get through — they've expired, or their account can't see this.",
             auth=True, no_post=no_post,
         )
-    for markers, text in _ERROR_MESSAGES:
+    for markers, text, user_side in _ERROR_MESSAGES:
         if any(marker in low for marker in markers):
-            return DownloadError(text, no_post=no_post, no_media=no_media, waf=waf)
+            return DownloadError(text, no_post=no_post, no_media=no_media, waf=waf,
+                                 user_side=user_side)
 
     # Unknown case: yt-dlp's own text, capped.
     if len(clean) > 200:
@@ -641,7 +647,7 @@ def _skip_live(info: dict, *, incomplete: bool = False) -> str | None:
 
 def _reject_live(info: dict) -> None:
     if _is_live(info):
-        raise DownloadError(_LIVE_MESSAGE)
+        raise DownloadError(_LIVE_MESSAGE, user_side=True)
 
 
 def _build_opts(config: Config, out_template: str, url: str, work_dir: str) -> dict:
@@ -794,7 +800,8 @@ def _download_blocking(url: str, config: Config, work_dir: str) -> DownloadResul
                 pass
         raise DownloadError(
             f"This is {total / 1024 / 1024:.0f} MB — over the "
-            f"{config.max_file_size_mb} MB limit."
+            f"{config.max_file_size_mb} MB limit.",
+            user_side=True,
         )
 
     # Carousels may keep the caption only in their items.
@@ -826,7 +833,7 @@ class ClipsResult:
     duration: int | None = None
     # Range index → clip or error. Ranges starting past the end are in neither.
     clips: dict[int, MediaItem] = field(default_factory=dict)
-    errors: dict[int, str] = field(default_factory=dict)
+    errors: dict[int, DownloadError] = field(default_factory=dict)
 
 
 def _clip_sections(ranges: list[tuple[int, int]]) -> Callable:
@@ -879,17 +886,19 @@ def _download_clips_blocking(
         path = next((p for p in _collect_media(work_dir)
                      if os.path.basename(p).startswith(f"clip-{i:03d}.")), None)
         if not path:
-            result.errors[i] = "couldn't cut this piece"
+            result.errors[i] = DownloadError("couldn't cut this piece")
             continue
         if os.path.getsize(path) == 0:
             os.remove(path)
-            result.errors[i] = "came out empty, the timecodes are outside the video"
+            result.errors[i] = DownloadError(
+                "came out empty, the timecodes are outside the video", user_side=True)
             continue
         # Cheap guard for odd sources (WebM without mp4 formats).
         path = _ensure_telegram_playable(path)
         if os.path.getsize(path) > config.max_file_size_bytes:
             os.remove(path)
-            result.errors[i] = f"over the {config.max_file_size_mb} MB limit"
+            result.errors[i] = DownloadError(
+                f"over the {config.max_file_size_mb} MB limit", user_side=True)
             continue
         meta = _probe_video(path)
         result.clips[i] = MediaItem(path=path, is_video=True, width=meta.get("w"),

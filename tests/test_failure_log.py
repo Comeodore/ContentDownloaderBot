@@ -3,6 +3,7 @@ import logging
 import re
 from types import SimpleNamespace
 
+import pytest
 import yt_dlp
 
 import bot
@@ -84,7 +85,7 @@ def test_unexpected_failure_is_an_error_with_traceback(caplog):
     try:
         raise RuntimeError("kaput")
     except RuntimeError as e:
-        rec = _logged(caplog, bot._SOMETHING_WRONG, downloader.error_detail(e), exc_info=True)
+        rec = _logged(caplog, "Unexpected error", downloader.error_detail(e), exc_info=True)
     assert rec.levelno == logging.ERROR and rec.exc_info
     assert ALERT_RE.search(rec.getMessage()).group("cause") == "RuntimeError: kaput"
 
@@ -92,3 +93,29 @@ def test_unexpected_failure_is_an_error_with_traceback(caplog):
 def test_percent_signs_are_kept(caplog):
     rec = _logged(caplog, "50% done %s")
     assert rec.getMessage().endswith("— 50% done %s")
+
+
+# What the user sees: the reason when it's theirs to deal with, else the standard reply.
+@pytest.mark.parametrize("raw, user_side", [
+    ("ERROR: [youtube] x: Video unavailable. This video has been removed", True),
+    ("ERROR: [generic] Unsupported URL: https://example.com", True),
+    ("ERROR: [Threads] x: This Threads post has no photo or video", True),
+    ("ERROR: [instagram:story+videobot] 1: Instagram story is gone: expired", True),
+    ("ERROR: [youtube] x: This live event will begin in 3 hours", True),
+    ("ERROR: [youtube] x: The uploader has not made this video available in your country", True),
+    ("ERROR: [Instagram] x: Failed to parse JSON", False),
+    ("ERROR: [Instagram] x: Instagram session expired: the API sent it to the login page", False),
+    ("ERROR: [youtube] x: Sign in to confirm you're not a bot", False),
+    ("ERROR: [TikTok] x: Your IP address is blocked from accessing this post", False),
+    ("ERROR: unable to download video data: HTTP Error 403: Forbidden", False),
+    ("ERROR: [Instagram] x: Read timed out", False),
+])
+def test_user_side_errors(raw, user_side):
+    err = downloader._as_download_error(_ytdlp_error(raw), "youtube")
+    assert err.user_side is user_side
+    assert bot._user_text(err) == (str(err) if user_side else bot._STANDARD_ERROR)
+
+
+def test_standard_reply_says_the_developer_knows():
+    assert "developer has already been notified" in bot._STANDARD_ERROR
+    assert bot._user_text(downloader.DownloadError("Cookie problem: x")) == bot._STANDARD_ERROR
