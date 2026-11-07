@@ -1,10 +1,8 @@
-# Content Downloader — деплой на сервер.
-# Каталог данных CONTENTDL_DATA_DIR (задаётся в .env) монтируется в ОБА контейнера
-# по одинаковому пути /var/lib/telegram-bot-api → Bot API server отдаёт файл
-# по пути (path-режим, до 2 ГБ).
+# CONTENTDL_DATA_DIR is mounted into both containers at the same path, so the
+# Bot API server can send files by path (up to 2 GB).
 
 services:
-  # ── Локальный Telegram Bot API server (снимает лимит 50 МБ → до 2 ГБ) ──
+  # ── Local Telegram Bot API server (lifts the 50 MB limit to 2 GB) ──
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest
     container_name: contentdl-bot-api-1
@@ -12,7 +10,7 @@ services:
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
-      TELEGRAM_LOCAL: "true"               # local-режим: чтение файлов с диска по пути
+      TELEGRAM_LOCAL: "true"               # read files from disk by path
     volumes:
       - ${CONTENTDL_DATA_DIR:-./data}:/var/lib/telegram-bot-api
     networks:
@@ -25,7 +23,7 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ── Сам бот ──
+  # ── The bot ──
   bot:
     build:
       context: .
@@ -43,13 +41,12 @@ services:
     depends_on:
       - telegram-bot-api
     volumes:
-      # ТОТ ЖЕ каталог и ТОТ ЖЕ путь, что у сервера — иначе path-режим не найдёт файл
+      # Same dir and path as the server, or path mode can't find the files
       - ${CONTENTDL_DATA_DIR:-./data}:/var/lib/telegram-bot-api
     networks:
       - contentdl
     labels:
-      # Образ собирается локально (build:.), в registry его нет — Watchtower его не трогает.
-      # yt-dlp бот обновляет сам (self-restart), код/образ — пересборкой.
+      # Built locally; yt-dlp updates itself on restart.
       com.centurylinklabs.watchtower.enable: "false"
     logging:
       driver: json-file
@@ -57,9 +54,8 @@ services:
         max-size: "10m"
         max-file: "3"
 
-# Своего Watchtower в стеке НЕТ: на хосте ubuntu работает общий watchtower
-# (/root/docker-compose.yml), он обновляет contentdl-bot-api-1 по имени. Второй
-# экземпляр без scope при старте останавливает и удаляет первый.
+# No Watchtower here: the host's shared one updates contentdl-bot-api-1, and a
+# second unscoped instance would stop and remove the first.
 
 networks:
   contentdl:

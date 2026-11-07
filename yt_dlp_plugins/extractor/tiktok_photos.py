@@ -1,16 +1,11 @@
-"""Фото-посты TikTok (слайдшоу) — плагин-экстрактор для yt-dlp.
+"""yt-dlp extractor plugin for TikTok photo posts (slideshows).
 
-Экстрактор TikTok в yt-dlp берёт только /video/<id>: ссылки /photo/<id> он не
-узнаёт вовсе («Unsupported URL»). Сама страница /photo/ данных поста не несёт —
-её рисует JS в браузере. Но тот же id, открытый как /video/<id>, TikTok отдаёт
-целиком, вместе с imagePost — проверено на фото-постах из 1, 2 и 16 картинок.
-Поэтому данные берём через _extract_web_data_and_status экстрактора TikTok (с
-его обходом WAF и JS-челленджа), а картинки отдаём плейлистом — бот пришлёт их
-альбомом. Фоновая музыка слайдшоу — последним элементом плейлиста (MP3): бот
-пришлёт её следом отдельным треком.
-
-По /photo/-ссылке TikTok отдаёт иногда и обычное видео — его передаём
-стандартному экстрактору.
+yt-dlp's TikTok extractor doesn't match /photo/<id>, and the /photo/ page has no
+post data (JS renders it). The same id opened as /video/<id> returns the whole
+post with imagePost (verified on 1, 2 and 16 images), so we fetch it through
+TikTokIE's own WAF handling. Images become a playlist (sent as an album), and
+the slideshow music its last entry. A /photo/ link that is really a video goes
+to the stock extractor.
 """
 import unicodedata
 
@@ -26,10 +21,9 @@ from yt_dlp.utils import (
 
 
 def _printable(text):
-    """Текст без неназначенных/служебных символов Unicode (None, если не осталось).
+    """Text without unassigned/control characters, or None.
 
-    В именах авторов TikTok встречаются «стилизованные» символы вроде U+FFF4,
-    которые клиенты Telegram рисуют квадратиками.
+    TikTok author names contain characters like U+FFF4 that Telegram draws as boxes.
     """
     text = ''.join(ch for ch in text or '' if unicodedata.category(ch) not in ('Cn', 'Co', 'Cs', 'Cc'))
     return text.strip() or None
@@ -44,7 +38,7 @@ class TikTokPhotoIE(TikTokIE):
         'info_dict': {'id': '7553302113757990166'},
         'playlist_count': 2,
     }, {
-        # Видео, отданное по /photo/-ссылке
+        # A video served under a /photo/ link
         'url': 'https://www.tiktok.com/@memezar/photo/7449708266168274208',
         'only_matching': True,
     }]
@@ -69,7 +63,7 @@ class TikTokPhotoIE(TikTokIE):
         })
         entries = []
         for index, image in enumerate(images, start=1):
-            # urlList — зеркала одной и той же картинки (JPEG); берём первое.
+            # urlList holds mirrors of the same JPEG.
             image_url = image['imageURL']['urlList'][0]
             entries.append({
                 **metadata,
@@ -87,10 +81,9 @@ class TikTokPhotoIE(TikTokIE):
             })
 
         if music_url := traverse_obj(data, ('music', 'playUrl', {url_or_none})):
-            # Как в экстракторе TikTok: тип — из mime_type в ссылке. Без него
-            # CDN отдаёт MP3 (audio/mpeg, с ID3); с mime_type=video_mp4 — AAC в
-            # MP4 без видео, то есть M4A (проверено на обоих). Кодеки не
-            # указываем: формат «без видео» не прошёл бы фильтр формата бота.
+            # The type comes from mime_type in the URL: without it the CDN serves
+            # MP3, with mime_type=video_mp4 an audio-only MP4, i.e. M4A (verified).
+            # No codecs set: an audio-only format would fail the bot's format filter.
             ext = traverse_obj(parse_qs(music_url), (
                 'mime_type', -1, {lambda x: x.replace('_', '/')}, {mimetype2ext})) or 'mp3'
             ext = 'm4a' if ext == 'mp4' else ext

@@ -1,8 +1,7 @@
-"""Телеграм-бот: присылаешь ссылку — получаешь видео без вотермарки.
+"""Telegram bot: send a link, get the video back.
 
-С локальным Bot API server работает в path-режиме: файл скачивается в общий
-с сервером каталог, и серверу передаётся путь, а не байты (без двойной передачи,
-лимит до 2 ГБ).
+With the local Bot API server it runs in path mode: files land in a directory
+shared with the server, which gets a path instead of bytes (up to 2 GB).
 """
 from __future__ import annotations
 
@@ -56,13 +55,11 @@ WELCOME = (
     "• Threads — videos, photos, carousels\n\n"
     "✂️ To cut clips, add timecodes after the link:\n"
     "<code>&lt;link&gt; 1:00-1:10, 2:10-2:55</code>\n"
-    # «30 min» — это MAX_CUT_SECONDS ниже.
+    # "30 min" is MAX_CUT_SECONDS.
     "Each range comes back as a separate video (up to 30 min in total)."
 )
 
-# Профиль бота в Telegram: имя, описание (его видно в пустом чате до /start) и
-# короткое описание (профиль бота, его пересылка). Синхронизируем на старте
-# (см. _sync_profile) — тексты живут здесь, а не только в настройках Telegram.
+# The bot's Telegram profile, synced on start by _sync_profile.
 BOT_NAME = "Content Downloader"
 BOT_SHORT_DESCRIPTION = (
     "Send a link — get the video, photos or slideshow from TikTok, Instagram, "
@@ -78,9 +75,8 @@ BOT_DESCRIPTION = (
     "✂️ Cut clips: add timecodes after the link, e.g. 1:00-1:10, 2:10-2:55"
 )
 
-# Чтобы не спамить владельцу про cookies — не чаще раза в 6 часов. Начинаем с
-# -inf, а не с 0: monotonic() отсчитывает от загрузки хоста, и после свежей
-# перезагрузки первое уведомление молчало бы до 6 часов аптайма.
+# Cookie reminders at most every 6 h. -inf, not 0: monotonic() counts from host
+# boot, so right after a reboot 0 would mute the first reminder.
 _last_cookie_notify = {"t": float("-inf")}
 
 
@@ -91,9 +87,9 @@ async def cmd_start(message: Message) -> None:
 
 @dp.message(F.document)
 async def handle_cookies_upload(message: Message, config: Config) -> None:
-    """Owner-flow: владелец присылает cookies.txt документом → горячая замена."""
+    """The owner sends cookies.txt as a document; it's merged in live."""
     if not config.owner_id or not message.from_user or message.from_user.id != config.owner_id:
-        return  # тихо игнорируем чужие документы
+        return  # others' documents are ignored
     doc = message.document
     name = (doc.file_name or "").lower()
     if not (name.endswith(".txt") or "cookie" in name):
@@ -105,8 +101,6 @@ async def handle_cookies_upload(message: Message, config: Config) -> None:
     if (doc.file_size or 0) > 1_000_000:
         await message.answer("That file is too big for a cookies.txt (limit 1 MB).")
         return
-    # Экспорт из браузера обычно по одному сайту, а файл один на все площадки —
-    # поэтому вливаем поверх (см. merge_cookies_file), а не перезаписываем.
     upload = config.cookies_file + ".upload"
     try:
         await message.bot.download(doc, destination=upload)
@@ -119,12 +113,11 @@ async def handle_cookies_upload(message: Message, config: Config) -> None:
             )
             return
         os.chmod(config.cookies_file, 0o600)
-        # yt-dlp читает cookiefile при каждом скачивании — перезагрузка не нужна.
         await message.answer("✅ Cookies updated for: " + html.quote(", ".join(domains)))
-        logger.info("Cookies обновлены владельцем %s: %s",
+        logger.info("Cookies updated by owner %s: %s",
                     message.from_user.id, ", ".join(domains))
     except Exception:  # noqa: BLE001
-        logger.exception("Не удалось сохранить cookies")
+        logger.exception("Couldn't save cookies")
         await message.answer("❌ Couldn't save the cookies — check the bot logs.")
     finally:
         try:
@@ -133,14 +126,13 @@ async def handle_cookies_upload(message: Message, config: Config) -> None:
             pass
 
 
-# Таймкод-диапазоны в сообщении: «1:00-1:10», «2:10-2:55», «1:02:03-1:02:30», «5-30».
-# Границы по краям — чтобы «2024-2025» в тексте не читалось как клип 0:24–3:22.
+# Timecode ranges: "1:00-1:10", "1:02:03-1:02:30", "5-30". The edge guards keep
+# "2024-2025" from reading as a 0:24–3:22 clip.
 _RANGE_RE = re.compile(
     r"(?<![\d:])(\d{1,3}(?::\d{2}){0,2})\s*[-–—]\s*(\d{1,3}(?::\d{2}){0,2})(?![\d:])")
 MAX_CLIPS = 20
-# Сколько секунд клипов можно заказать одним сообщением. Куски кодируются в
-# H.264 на CPU мини-ПК, а бот открыт всем — без потолка один запрос
-# «0:00-10:00:00» занимал бы его часами.
+# Clip seconds per message: pieces are encoded on the mini-PC's CPU, and the bot
+# is public.
 MAX_CUT_SECONDS = 30 * 60
 
 
@@ -158,8 +150,8 @@ def _fmt_ts(sec: int) -> str:
 
 
 def _parse_ranges(text: str, url: str) -> tuple[list[tuple[int, int]], list[str]]:
-    """Возвращает (валидные диапазоны, отвергнутые строки с start>=end)."""
-    # Убираем URL, чтобы цифры внутри него (напр. дефис в YouTube-ID) не ловились как диапазон.
+    """(valid ranges, rejected strings with start >= end)."""
+    # Without the URL, so digits in it (a dash in a YouTube ID) aren't ranges.
     cleaned = (text or "").replace(url, " ") if url else (text or "")
     ranges, rejected = [], []
     for m in _RANGE_RE.finditer(cleaned):
@@ -172,7 +164,7 @@ def _parse_ranges(text: str, url: str) -> tuple[list[tuple[int, int]], list[str]
 
 
 def _looks_like_timecodes(text: str) -> bool:
-    """Похоже ли, что пользователь ХОТЕЛ таймкоды (есть mm:ss), но распарсить не вышло."""
+    """Whether the text has mm:ss, i.e. the user meant timecodes."""
     return bool(re.search(r"\d{1,2}:\d{2}", text or ""))
 
 
@@ -195,7 +187,7 @@ async def handle_link(message: Message, config: Config) -> None:
     if ranges:
         await _handle_cut(message, config, url, ranges, rejected)
     elif rejected or _looks_like_timecodes(cleaned):
-        # Таймкоды явно задуманы, но ни один не распарсился — не качаем молча всё видео.
+        # Timecodes were meant but none parsed: don't download the whole video.
         await message.answer(
             "⚠️ I couldn't read those timecodes. Use e.g. "
             "<code>1:00-1:10, 2:10-2:55</code> — format mm:ss, start before end."
@@ -204,9 +196,8 @@ async def handle_link(message: Message, config: Config) -> None:
         await _handle_full(message, config, url)
 
 
-# Осиротевшие каталоги запросов: если процесс убили посреди скачивания
-# (плановый рестарт, OOM), rmtree в finally не выполнился и каталог остаётся
-# на диске навсегда. Подметаем на старте — там же лежат гигабайтные файлы.
+# Request directories left behind by a killed process (restart, OOM) are swept
+# on start: they can hold gigabytes.
 STALE_WORK_DIR_AGE = 6 * 3600
 
 
@@ -218,7 +209,7 @@ def _sweep_stale_work_dirs(config: Config) -> None:
             if not os.path.isdir(path):
                 continue
             try:
-                # Свежие не трогаем: вдруг рядом работает второй экземпляр.
+                # Fresh ones may belong to a second running instance.
                 if now - os.path.getmtime(path) < STALE_WORK_DIR_AGE:
                     continue
             except OSError:
@@ -226,51 +217,43 @@ def _sweep_stale_work_dirs(config: Config) -> None:
             shutil.rmtree(path, ignore_errors=True)
             removed += 1
     if removed:
-        logger.info("Убрано осиротевших каталогов загрузок: %d", removed)
+        logger.info("Removed stale download dirs: %d", removed)
 
 
-# Сколько запросов обрабатываем одновременно. Каждый — поток yt-dlp, а
-# перекодирование и нарезка грузят CPU мини-ПК (4 ядра); бот открыт всем,
-# поэтому остальные запросы ждут в очереди — и видят это в статусе.
+# Concurrent requests: encoding loads the mini-PC's 4 cores; the rest queue.
 MAX_PARALLEL_JOBS = 3
 _job_slots = asyncio.Semaphore(MAX_PARALLEL_JOBS)
-# Запросы в работе, включая ждущие в очереди: плановый рестарт ждёт, пока их не станет.
+# Requests in progress or queued; the scheduled restart waits for zero.
 _jobs_in_flight = 0
 
 
-# Анимированные custom emoji «идёт работа» в конце статуса, каждый раз случайный.
-# Боту они доступны, пока у владельца бота есть Telegram Premium. Спиннеры — из
-# пака бота contentdl_loading_by_comeodore_download_bot: он с needs_repainting,
-# и Telegram красит их в цвет текста. Годится только такой: те же точки из
-# чужого пака LoadingEmojis (5981246029926764162) залиты белым без перекраски, и
-# в светлой теме на белом пузыре статус выглядел как голое «Downloading».
-# Там же лежит растущая дуга (5424626441687968723) — владельцу точки милее.
+# Animated custom emoji at the end of a status; they work while the bot's owner
+# has Telegram Premium. They must come from the bot's pack
+# contentdl_loading_by_comeodore_download_bot, which has needs_repainting:
+# non-repainted white dots (5981246029926764162) vanish in the light theme.
+# The pack also holds an arc spinner (5424626441687968723).
 _SPINNER_IDS = (
-    "5438353462108662341",  # точки
+    "5438353462108662341",  # dots
 )
 
 
 def _spinner() -> str:
-    # ⏳ — запасной символ: его видно в уведомлениях и превью чата.
+    # ⏳ shows in notifications and the chat list.
     return f'<tg-emoji emoji-id="{random.choice(_SPINNER_IDS)}">⏳</tg-emoji>'
 
 
 async def _send_status(message: Message, text: str) -> Message:
-    """Статусное сообщение; не принял Telegram custom emoji — шлём без них.
-
-    Без этого кончившийся Premium владельца ронял бы обработку любой ссылки
-    на самом первом сообщении.
-    """
+    """Sends a status, without custom emoji if Telegram rejects them (no Premium)."""
     try:
         return await message.answer(text)
     except TelegramBadRequest:
-        logger.warning("Telegram не принял custom emoji в статусе — шлю без них")
+        logger.warning("Telegram rejected the status's custom emoji, sending without")
         return await message.answer(re.sub(r"<tg-emoji[^>]*>(.*?)</tg-emoji>", r"\1", text))
 
 
 @contextlib.asynccontextmanager
 async def _job(status: Message, working_text: str):
-    """Место в очереди запросов; пока ждём — статус об этом говорит."""
+    """A request slot; the status says so while waiting."""
     global _jobs_in_flight
     _jobs_in_flight += 1
     try:
@@ -293,18 +276,16 @@ async def _report_download_error(
     message: Message, status: Message, config: Config, url: str,
     e: downloader.DownloadError,
 ) -> None:
-    """Ошибку скачивания — в лог и пользователю (текст экранируем: HTML-режим)."""
-    logger.info("Не скачалось для %s: %s — %s", _who(message), url, e)
+    """Logs a download error and shows it to the user."""
+    logger.info("Download failed for %s: %s — %s", _who(message), url, e)
     await status.edit_text(f"❌ {html.quote(str(e))}")
     if e.auth and _needs_cookies(url):
         await _notify_owner_cookies(message.bot, config, url)
 
 
 async def _handle_full(message: Message, config: Config, url: str) -> None:
-    # Статус один на всё время — и скачивание, и отправку. Процентов нет: мелкие
-    # файлы докачивались раньше второй правки, и видно было только «0%», а
-    # прогресс отправки боту не виден вовсе — в path-режиме файл в Telegram
-    # заливает сам Bot API server, бот лишь ждёт ответа.
+    # One status for download and upload, no percentages: small files finished
+    # before the second edit, and in path mode the upload isn't visible to the bot.
     working_text = f"Downloading {_spinner()}"
     status = await _send_status(message, working_text)
 
@@ -318,19 +299,19 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
                 await _report_download_error(message, status, config, url, e)
                 return
             except Exception:  # noqa: BLE001
-                logger.exception("Неожиданная ошибка при скачивании %s", url)
+                logger.exception("Unexpected error downloading %s", url)
                 await status.edit_text(
                     "❌ Something went wrong while handling this link."
                 )
                 return
-            logger.info("Скачано для %s: %s — %d файл(ов), %.1f МБ", _who(message), url,
+            logger.info("Downloaded for %s: %s — %d file(s), %.1f MB", _who(message), url,
                         len(result.items), result.total_size / 1024 / 1024)
 
             try:
                 await _send_media(message, result, url)
                 await status.delete()
             except Exception:  # noqa: BLE001
-                logger.exception("Не удалось отправить медиа")
+                logger.exception("Couldn't send media")
                 await status.edit_text(
                     "❌ Downloaded it, but Telegram didn't accept the file."
                 )
@@ -367,17 +348,17 @@ async def _handle_cut(
                 await _report_download_error(message, status, config, url, e)
                 return
             except Exception:  # noqa: BLE001
-                logger.exception("cut: не удалось скачать %s", url)
+                logger.exception("cut: couldn't download %s", url)
                 await status.edit_text(
                     "❌ Something went wrong while handling this link."
                 )
                 return
-            logger.info("Нарезано для %s: %s — %d из %d клип(ов)", _who(message), url,
+            logger.info("Cut for %s: %s — %d of %d clip(s)", _who(message), url,
                         len(result.clips), len(ranges))
 
             vdur = result.duration
             sent = 0
-            for i, (start, end) in enumerate(ranges):  # по порядку → и приходят по порядку
+            for i, (start, end) in enumerate(ranges):  # sent in order
                 label = f"{_fmt_ts(start)}–{_fmt_ts(end)}"
                 if vdur and start >= vdur:
                     await message.answer(
@@ -400,7 +381,7 @@ async def _handle_cut(
                     )
                     sent += 1
                 except Exception:  # noqa: BLE001
-                    logger.exception("cut: не удалось отправить клип %s", label)
+                    logger.exception("cut: couldn't send clip %s", label)
                     await message.answer(f"❌ {label}: Telegram didn't accept this clip")
 
             if sent:
@@ -416,8 +397,7 @@ def _chunks(items: list, n: int):
         yield items[i : i + n]
 
 
-# Лимит Telegram на caption. Считается в UTF-16 code units (эмодзи = 2 юнита),
-# поэтому режем не по len(), а по юнитам.
+# Telegram counts the caption limit in UTF-16 code units, not characters.
 CAPTION_LIMIT = 1024
 
 
@@ -425,29 +405,25 @@ def _truncate_utf16(text: str, limit: int = CAPTION_LIMIT) -> str:
     units = 0
     for i, ch in enumerate(text):
         units += 2 if ord(ch) > 0xFFFF else 1
-        if units > limit - 1:  # -1: запас под «…»
+        if units > limit - 1:  # room for "…"
             return text[:i] + "…"
     return text
 
 
 def _caption_for(result: downloader.DownloadResult) -> str | None:
-    """Текст поста для caption: description (полный текст), иначе title."""
+    """The post text for the caption: description, else title."""
     text = (result.description or "").strip() or (result.title or "").strip()
     if not text or text == "video":
         return None
-    # Пост может содержать <, > и & — экранируем, т.к. бот шлёт в HTML parse mode.
     return html.quote(_truncate_utf16(text))
 
 
 async def _send_media(message: Message, result: downloader.DownloadResult, url: str) -> None:
-    # Текст поста добавляем только для Threads — у остальных источников
-    # description обычно мусорный (хэштеги, авто-заголовки).
+    # Captions only for Threads: elsewhere descriptions are mostly hashtags.
     caption = _caption_for(result) if downloader.is_threads(url) else None
     visual = [it for it in result.items if not it.is_audio]
 
-    # Слайдшоу / карусель — отправляем альбомами по 10 (лимит Telegram).
-    # Caption вешаем только на первый элемент первого альбома — Telegram
-    # показывает его под всем альбомом.
+    # Albums of up to 10; the caption on the first item shows under the album.
     for chunk in _chunks(visual, 10):
         if len(chunk) == 1:
             await _send_single(message, chunk[0], caption)
@@ -464,8 +440,7 @@ async def _send_media(message: Message, result: downloader.DownloadResult, url: 
             caption = None
         await message.answer_media_group(media=media)
 
-    # Музыка слайдшоу TikTok. В альбом к фото звук не положить (Telegram
-    # группирует аудио только с аудио) — шлём следом отдельным треком.
+    # TikTok slideshow music: audio can't join a photo album, so it follows alone.
     for it in result.items:
         if it.is_audio:
             await message.answer_audio(
@@ -497,25 +472,21 @@ async def _send_single(
 async def _safe_edit(status: Message, text: str) -> None:
     try:
         await status.edit_text(text)
-    except Exception:  # noqa: BLE001  (message not modified / rate-limit — не страшно)
+    except Exception:  # noqa: BLE001  (not modified / rate limit)
         pass
 
 
-# Площадки, где бот держит сессию в cookies.txt (их домен — в напоминании).
+# Sites with a session in cookies.txt, and the domain named in reminders.
 _COOKIE_SITES = {"instagram": "instagram.com", "threads": "threads.com"}
 
 
 def _needs_cookies(url: str) -> bool:
-    """Площадки, где логин-ошибка означает протухшие cookies, а не битую ссылку."""
+    """Whether a login error on this link means the saved cookies failed."""
     return downloader.site_of(url) in _COOKIE_SITES
 
 
 async def _notify_owner_cookies(bot: Bot, config: Config, url: str) -> None:
-    """Сообщает владельцу о протухших cookies (не чаще раза в 6 часов).
-
-    Повод — ошибка доступа уже под сессией: гостем бот пробует первым и без
-    сессии в cookies.txt владельца не дёргает (см. downloader._extract_info).
-    """
+    """Tells the owner the saved session failed, at most every 6 h."""
     if not config.owner_id:
         return
     now = time.monotonic()
@@ -533,24 +504,21 @@ async def _notify_owner_cookies(bot: Bot, config: Config, url: str) -> None:
     try:
         await bot.send_message(config.owner_id, text)
     except Exception:  # noqa: BLE001
-        logger.exception("Не удалось уведомить владельца про cookies")
+        logger.exception("Couldn't send the cookie reminder")
 
 
-# Отметка «event loop жив»: heartbeat ставит её на каждом ходе, watchdog-поток
-# проверяет, не застыла ли она.
+# Set by _heartbeat each turn, checked by the watchdog thread.
 _loop_tick = {"t": time.monotonic()}
-# Столько секунд без отметки = loop завис (ход heartbeat — раз в 30 с).
+# Seconds without a tick that mean the loop hung (heartbeat runs every 30 s).
 LOOP_STALL_LIMIT = 180
-# Свой поток для пушей в health-monitor: общий пул asyncio занят скачиваниями
-# (to_thread), и при загруженном пуле heartbeat ждал бы там своей очереди.
+# Own thread for monitor pushes: the default pool is busy with downloads.
 _beat_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="heartbeat")
 
 
 async def _heartbeat() -> None:
-    """Раз в 30 с: отметка для watchdog, файл-маячок для HEALTHCHECK, пуш в монитор.
+    """Every 30 s: watchdog tick, HEALTHCHECK file, monitor push.
 
-    Всё идёт с event loop: если он завис, маячок стареет, пуши прекращаются,
-    а watchdog перезапускает процесс (см. _start_watchdog).
+    All from the event loop, so a hung loop stops them all.
     """
     loop = asyncio.get_running_loop()
     while True:
@@ -560,61 +528,55 @@ async def _heartbeat() -> None:
                 f.write(str(int(time.time())))
         except OSError:
             pass
-        # Ответа не ждём: медленный или лежащий монитор не должен тормозить этот
-        # цикл. beat() сам глотает свои ошибки.
+        # Not awaited: a slow monitor mustn't stall the loop; beat() swallows errors.
         loop.run_in_executor(_beat_pool, lambda: beat("polling alive", service_id="contentdl-bot"))
         await asyncio.sleep(30)
 
 
 def _start_watchdog() -> None:
-    """Поток, который перезапускает процесс, если event loop завис.
+    """Exits the process if the event loop hangs.
 
-    Docker сам unhealthy-контейнер не рестартит: restart-политика срабатывает
-    только на выход процесса. Поэтому выходим сами — `restart: unless-stopped`
-    поднимет бота заново.
+    Docker doesn't restart unhealthy containers, only exited ones.
     """
     def watch() -> None:
         while True:
             time.sleep(30)
             stalled = time.monotonic() - _loop_tick["t"]
             if stalled > LOOP_STALL_LIMIT:
-                logger.critical("Event loop не отвечает %.0f с — перезапускаю процесс", stalled)
+                logger.critical("Event loop stalled for %.0f s, restarting the process", stalled)
                 os._exit(1)
 
     threading.Thread(target=watch, name="watchdog", daemon=True).start()
 
 
 async def _sync_profile(bot: Bot) -> None:
-    """Приводит имя и описания бота в Telegram к BOT_NAME/BOT_*DESCRIPTION.
+    """Syncs the bot's name and descriptions with BOT_NAME/BOT_*DESCRIPTION.
 
-    Меняем только то, что отличается: setMyName у Telegram жёстко лимитирован,
-    а бот перезапускается каждый день. Сбой — не повод не стартовать.
+    Only what differs is set: setMyName is tightly rate-limited and the bot
+    restarts daily. Failures don't stop the start.
     """
     try:
         if (await bot.get_my_name()).name != BOT_NAME:
             await bot.set_my_name(name=BOT_NAME)
-            logger.info("Имя бота обновлено: %s", BOT_NAME)
+            logger.info("Bot name updated: %s", BOT_NAME)
         if (await bot.get_my_description()).description != BOT_DESCRIPTION:
             await bot.set_my_description(description=BOT_DESCRIPTION)
-            logger.info("Описание бота обновлено")
+            logger.info("Bot description updated")
         if (await bot.get_my_short_description()).short_description != BOT_SHORT_DESCRIPTION:
             await bot.set_my_short_description(short_description=BOT_SHORT_DESCRIPTION)
-            logger.info("Короткое описание бота обновлено")
+            logger.info("Bot short description updated")
     except Exception:  # noqa: BLE001
-        logger.warning("Не удалось обновить профиль бота", exc_info=True)
+        logger.warning("Couldn't update the bot profile", exc_info=True)
 
 
-# Сколько плановый рестарт ждёт простоя, прежде чем перезапуститься всё равно.
+# How long the scheduled restart waits for idle before restarting anyway.
 RESTART_IDLE_WAIT = 3600
 
 
 async def _scheduled_restart(hours: int) -> None:
-    """Раз в `hours` часов мягко гасим процесс через SIGTERM — дождавшись простоя.
-
-    Docker с `restart: unless-stopped` поднимет контейнер заново, а entrypoint
-    при старте обновит yt-dlp. Так библиотека всегда свежая без пересборки образа.
-    Рестарт посреди скачивания оставил бы пользователя с вечным «Downloading…»,
-    поэтому ждём, пока запросов в работе не станет (но не дольше RESTART_IDLE_WAIT).
+    """Every `hours` hours, SIGTERMs the process once idle, so the entrypoint
+    updates yt-dlp on restart. A restart mid-download would leave the user with
+    an endless "Downloading", hence the wait (up to RESTART_IDLE_WAIT).
     """
     if hours <= 0:
         return
@@ -623,9 +585,9 @@ async def _scheduled_restart(hours: int) -> None:
     while _jobs_in_flight and time.monotonic() < deadline:
         await asyncio.sleep(10)
     if _jobs_in_flight:
-        logger.warning("Плановый рестарт: простоя не дождался, прерываю запросов: %d",
+        logger.warning("Scheduled restart: never idle, interrupting %d request(s)",
                        _jobs_in_flight)
-    logger.info("Плановый рестарт (%d ч) для обновления yt-dlp — шлю SIGTERM.", hours)
+    logger.info("Scheduled restart (%d h) to update yt-dlp, sending SIGTERM", hours)
     os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -634,10 +596,10 @@ async def main() -> None:
 
     session = None
     if config.is_local_server:
-        # is_local=True → aiogram шлёт серверу путь к файлу вместо multipart-аплоада.
+        # is_local: aiogram sends the server a file path instead of uploading.
         api_server = TelegramAPIServer.from_base(config.telegram_api_base, is_local=True)
         session = AiohttpSession(api=api_server)
-        logger.info("Локальный Bot API server (path-режим): %s", config.telegram_api_base)
+        logger.info("Local Bot API server (path mode): %s", config.telegram_api_base)
 
     bot = Bot(
         token=config.bot_token,
@@ -650,15 +612,14 @@ async def main() -> None:
     os.makedirs(config.download_dir, exist_ok=True)
     _sweep_stale_work_dirs(config)
 
-    logger.info("Бот запущен. Каталог загрузок: %s | owner: %s", config.download_dir, config.owner_id)
+    logger.info("Bot started. Downloads: %s | owner: %s", config.download_dir, config.owner_id)
 
     bg = [
         asyncio.create_task(_heartbeat()),
         asyncio.create_task(_scheduled_restart(config.auto_update_hours)),
     ]
     _start_watchdog()
-    # Апдейты, пришедшие, пока бот лежал (плановый рестарт, деплой), не
-    # выбрасываем: иначе ссылки, присланные в эти секунды, молча терялись бы.
+    # Keep updates sent while the bot was down (restart, deploy).
     await bot.delete_webhook(drop_pending_updates=False)
     await _sync_profile(bot)
     try:
@@ -672,4 +633,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Остановлен.")
+        logger.info("Stopped.")

@@ -7,9 +7,9 @@ downloads/
 *.log
 .git/
 .claude/
-# Сессии площадок не должны попадать в образ, даже если файл лежит рядом.
+# Site sessions must never end up in the image.
 cookies.txt*
-# Мусор деплоя на сервере: бэкапы рядом с кодом и AppleDouble-файлы от macOS tar.
+# Deploy leftovers: backups next to the code, AppleDouble files from macOS tar.
 .bak-*/
 *.bak-*
 **/._*

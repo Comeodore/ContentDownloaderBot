@@ -1,9 +1,8 @@
-"""Обёртка над yt-dlp: скачивание видео/фото из TikTok / Instagram / YouTube Shorts / Threads.
+"""yt-dlp wrapper: videos and photos from TikTok, Instagram, YouTube and Threads.
 
-Поддерживает одиночные видео, фото и карусели/слайдшоу (несколько медиа в
-посте), у слайдшоу TikTok — и фоновую музыку. Фото Instagram, сторис, Threads и
-фото-посты TikTok — свои плагины в yt_dlp_plugins: сам yt-dlp у этих площадок
-берёт только видео.
+Handles single videos, photos and multi-item posts (carousels, TikTok slideshows
+with music). Instagram photos and stories, Threads and TikTok photo posts come
+from our plugins in yt_dlp_plugins: yt-dlp itself only takes videos there.
 """
 from __future__ import annotations
 
@@ -28,78 +27,70 @@ from config import Config
 
 logger = logging.getLogger("videobot.downloader")
 
-# Плеер Telegram (особенно iOS) надёжно играет только H.264 8-bit yuv420p.
-# HEVC → лагает, VP9/AV1 → застывает картинка (звук идёт). Всё не-H.264 перекодируем.
+# Telegram's player (iOS especially) reliably plays only 8-bit yuv420p H.264:
+# HEVC stutters, VP9/AV1 freeze the picture. Everything else is re-encoded.
 _TELEGRAM_VCODEC = "h264"
 _TELEGRAM_PIX = {"yuv420p", "yuvj420p"}
-# Звук: Opus/Vorbis, которые YouTube отдаёт и yt-dlp кладёт в mp4, Telegram-клиенты
-# играют не везде — их перекодируем в AAC (дёшево, видео при этом не трогаем).
+# Opus/Vorbis in mp4 (YouTube) doesn't play in every client: the audio becomes AAC.
 _TELEGRAM_ACODECS = {"aac", "mp3"}
 
-# Настройки кодирования для Telegram. CRF 18 ≈ визуально без потерь; preset
-# влияет только на размер/скорость при том же качестве — veryfast ради CPU мини-ПК.
+# CRF 18 is visually lossless; veryfast spares the mini-PC's CPU.
 _H264_ARGS = [
     "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
     "-preset", "veryfast", "-crf", "18",
 ]
 _AAC_ARGS = ["-c:a", "aac", "-b:a", "160k"]
 
-# Площадки бота. Хост ссылки должен совпасть с одним из доменов или быть его
-# поддоменом — сверяем разобранный хост, а не подстроку: раньше «tiktok.com»
-# где угодно в ссылке (хоть в query) пропускал её в yt-dlp, а generic-экстрактор
-# качал что угодно, включая адреса домашней сети, и бот пересылал это в чат.
+# The link's parsed host must be one of these domains or a subdomain. A substring
+# match once let "tiktok.com" anywhere in a URL through to the generic extractor,
+# which fetched any address, LAN ones included.
 _SITES = {
     "tiktok": ("tiktok.com",),
     "instagram": ("instagram.com", "instagr.am"),
-    # youtube-nocookie.com — «приватный» встроенный плеер на сайтах (/embed/).
+    # youtube-nocookie.com: the embedded player (/embed/).
     "youtube": ("youtube.com", "youtu.be", "youtube-nocookie.com"),
     "threads": ("threads.com", "threads.net"),
 }
 
-# Только экстракторы постов наших площадок (yt-dlp сверяет имена целиком).
-# Без этого списка ссылку, которую не узнал ни один из них, подбирает generic —
-# а он идёт по любому адресу, в том числе по редиректу с площадки куда-то ещё.
-# Профили, теги и подборки (tiktok:user, instagram:user, …) тоже не берём:
-# ссылка на профиль выкачивала бы чужой аккаунт целиком.
+# Post extractors of our sites only (names match in full). Otherwise generic takes
+# unrecognised links and follows any address or redirect. Profiles, tags and feeds
+# (tiktok:user, …) are left out: a profile link would pull a whole account.
 _ALLOWED_EXTRACTORS = [
-    r"tiktok", r"vm\.tiktok",                # ролик и короткие vm./t/ ссылки
-    r"tiktok:photo",                         # наш плагин: фото-посты
-    # Пост/рилс и сторис. «+videobot» — наши надстройки (фото, сторис по
-    # номеру): yt-dlp подменяет ими свои экстракторы, и суффикс в имени есть.
+    r"tiktok", r"vm\.tiktok",                # videos and short vm./t/ links
+    r"tiktok:photo",                         # our plugin: photo posts
+    # "+videobot": our overrides of yt-dlp's extractors carry this suffix.
     r"instagram(?:\+videobot)?", r"instagram:story(?:\+videobot)?",
-    r"youtube", r"youtube:tab",              # tab — ролик, открытый из плейлиста
-    r"youtube:clip",                         # клипы YouTube (/clip/<id>)
-    r"threads",                              # наш плагин
+    r"youtube", r"youtube:tab",              # tab: a video opened from a playlist
+    r"youtube:clip",
+    r"threads",                              # our plugin
 ]
 
-# Ролики YouTube помимо /watch?v=: Shorts, встроенный плеер с сайтов (/embed/<id>)
-# и клипы (/clip/<id>). У /embed/ одиннадцать символов ещё у videoseries и
-# live_stream — это плейлист и эфир канала, их не берём.
+# YouTube videos besides /watch?v=: Shorts, embeds and clips. The 11-character
+# embeds videoseries and live_stream are a playlist and a channel's live.
 _YOUTUBE_VIDEO_PATH_RE = re.compile(
     r"/(?:shorts/[\w-]+|embed/(?!videoseries|live_stream)[\w-]{11}|clip/[\w-]+)/?")
 
-# Прямые эфиры (и ещё не начавшиеся) не качаем: запись шла бы, пока эфир не
-# кончится, — часами, а у круглосуточных трансляций бесконечно, занимая слот.
+# Lives and upcoming premieres aren't downloaded: the recording would hold a slot
+# until the stream ends, for hours or forever.
 _LIVE_STATUSES = ("is_live", "is_upcoming")
 _LIVE_MESSAGE = (
     "This is a live stream or a premiere that hasn't happened yet — I don't "
     "download those. Send the link after it's over."
 )
 
-# Сколько медиа поста берём: фото-пост TikTok — до 35 картинок и музыка,
-# карусель Instagram — до 20. Бот шлёт их альбомами по 10 (лимит media group).
+# A TikTok photo post has up to 35 pictures plus music, an Instagram carousel 20.
 MAX_POST_ITEMS = 36
 
 _URL_RE = re.compile(r"https?://\S+")
-# Знаки, которые на конце ссылки в тексте почти всегда пунктуация, а не её часть.
+# Trailing characters that belong to the surrounding text, not the link.
 _URL_TAIL = ".,;:!?…»\"'>]"
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov"}
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
-# Отдельным треком приходит музыка слайдшоу TikTok (MP3 или M4A).
+# TikTok slideshow music comes as a separate track.
 AUDIO_EXTS = {".mp3", ".m4a"}
 _SKIP_EXTS = {".part", ".ytdl", ".temp", ".f4v"}
-# Промежуточные дорожки yt-dlp до склейки видео со звуком: «001-id.f140.m4a».
+# yt-dlp's tracks before merging: "001-id.f140.m4a".
 _INTERMEDIATE_RE = re.compile(r"\.f[^.]+\.[^.]+$")
 
 
@@ -110,7 +101,7 @@ class MediaItem:
     width: int | None = None
     height: int | None = None
     duration: int | None = None
-    # Аудио (музыка слайдшоу): бот шлёт его отдельным треком с этими подписями.
+    # Slideshow music, sent as a separate track with these tags.
     is_audio: bool = False
     title: str | None = None
     performer: str | None = None
@@ -125,19 +116,15 @@ class DownloadResult:
 
 
 class DownloadError(Exception):
-    """Пользовательская ошибка скачивания (текст показываем пользователю).
+    """Download error; the message is shown to the user.
 
-    auth=True — сохранённые cookies площадки не сработали (login required /
-    rate-limit / протухшая сессия) → повод уведомить владельца. Когда cookies
-    площадки у бота нет вовсе, не ставим: чинить нечего, а пользователь и так
-    видит «Cookie problem» (см. _extract_info).
-    no_post=True — страницу поста вообще не отдали (редирект на главную,
-    заготовка без данных, 404): пост скрыт от гостя → есть смысл переспросить
-    под сессией, см. _extract_info.
-    no_media=True — пост отдали, но медиа в нём не нашлось → тоже
-    переспрашиваем под сессией.
-    waf=True — WAF площадки отверг TLS-отпечаток (TikTok): есть смысл повторить
-    с другим impersonate-таргетом, см. _extract_info_attempts.
+    auth: the site's saved cookies didn't work, so the owner gets a reminder.
+        Not set when the bot has no cookies for the site at all.
+    no_post: the post page wasn't served (redirect home, empty shell, 404).
+    no_media: the post came without media.
+        Both are worth retrying under the session (see _extract_info).
+    waf: the site's WAF rejected the TLS fingerprint (TikTok); retry with
+        another impersonate target.
     """
 
     def __init__(self, message: str, auth: bool = False, no_post: bool = False,
@@ -154,8 +141,7 @@ def extract_url(text: str) -> str | None:
     if not match:
         return None
     url = match.group(0)
-    # «(https://youtu.be/abc).» — хвост из текста, не из ссылки. Закрывающую
-    # скобку режем, только если у неё нет пары внутри ссылки.
+    # "(https://youtu.be/abc)." — a closing parenthesis goes only if unpaired.
     while url:
         if url[-1] in _URL_TAIL:
             url = url[:-1]
@@ -167,14 +153,14 @@ def extract_url(text: str) -> str | None:
 
 
 def site_of(url: str) -> str | None:
-    """Площадка бота по ссылке ("tiktok", "instagram", "youtube", "threads") или None."""
+    """The link's site ("tiktok", "instagram", "youtube", "threads") or None."""
     try:
         parts = urlsplit(url)
         port = parts.port
     except ValueError:
         return None
-    # userinfo («tiktok.com@192.168.0.1») и обратный слэш — классика расхождения
-    # парсеров: urlsplit видит один хост, а HTTP-клиент может пойти на другой.
+    # userinfo ("tiktok.com@192.168.0.1") and backslashes make URL parsers
+    # disagree on the host.
     if (parts.scheme not in ("http", "https") or "@" in parts.netloc
             or "\\" in url or port not in (None, 80, 443)):
         return None
@@ -183,8 +169,8 @@ def site_of(url: str) -> str | None:
         for domain in domains:
             if host != domain and not host.endswith("." + domain):
                 continue
-            # С youtube.com берём только ролики: канал или плейлист без v=
-            # выкачивался бы целиком. Записи эфиров (/live/<id>) не берём.
+            # Only videos: a channel or playlist would download whole.
+            # Live recordings (/live/<id>) are excluded too.
             if domain == "youtube.com" and not (
                     _YOUTUBE_VIDEO_PATH_RE.fullmatch(parts.path)
                     or (parts.path == "/watch" and parse_qs(parts.query).get("v"))):
@@ -202,11 +188,10 @@ def is_supported(url: str) -> bool:
 
 
 def _normalize_url(url: str) -> str:
-    """Ссылка TikTok в форме, которую узнаёт экстрактор yt-dlp; прочие — как есть.
+    """TikTok links in the form yt-dlp recognises; others unchanged.
 
-    Экстрактор TikTok требует хост www.tiktok.com: ссылки без www
-    (tiktok.com/@u/video/1) и старые мобильные m.tiktok.com/v/<id>.html он не
-    узнаёт («Unsupported URL»). Короткие vm./vt. не трогаем — у них свой экстрактор.
+    The extractor needs www.tiktok.com: links without www and old mobile
+    m.tiktok.com/v/<id>.html are "Unsupported URL". vm./vt. have their own.
     """
     if site_of(url) != "tiktok":
         return url
@@ -224,7 +209,7 @@ def is_threads(url: str) -> bool:
 
 
 class _SameSiteRedirects(urllib.request.HTTPRedirectHandler):
-    """Редиректы, которые не уводят с площадки исходной ссылки (иначе — ошибка)."""
+    """Follows redirects only within the original link's site."""
 
     max_redirections = 5
 
@@ -239,14 +224,10 @@ class _SameSiteRedirects(urllib.request.HTTPRedirectHandler):
 
 
 def _resolve_share_link(url: str) -> str:
-    """instagram.com/share/… и threads.com/share/… → ссылка на сам пост; остальные как есть.
+    """Resolves instagram.com/share/… and threads.com/share/… to the post link.
 
-    Экстрактор Instagram share-ссылки не берёт (в его _VALID_URL они исключены):
-    это редирект на /reel/<id> или /p/<id>. Threads так же редиректит
-    /share/<код> на /@user/post/<id>, а наш плагин знает только вторую форму.
-    Раньше их разворачивал generic, но он теперь под запретом
-    (_ALLOWED_EXTRACTORS) — разворачиваем сами, сверяя каждый шаг: увести запрос
-    с площадки такая ссылка не может.
+    Neither extractor takes share links, and generic is disallowed, so the
+    redirects are followed here, checking every hop stays on the site.
     """
     site = site_of(url)
     if site not in ("instagram", "threads") or not urlsplit(url).path.startswith("/share/"):
@@ -257,40 +238,37 @@ def _resolve_share_link(url: str) -> str:
         with opener.open(request, timeout=15) as resp:
             final = resp.geturl()
     except (OSError, ValueError) as e:
-        logger.info("Share-ссылку не развернуть (%s): %s", url, e)
+        logger.info("Couldn't resolve share link (%s): %s", url, e)
         return url
     return final if site_of(final) == site else url
 
 
-# ── Подмена impersonate-таргета curl_cffi ───────────────────────────────────
-# TikTok-экстрактор просит «любой» таргет, и yt-dlp берёт первый из своей карты
-# (самый свежий Chrome). Площадки периодически банят конкретный TLS-отпечаток:
-# в ответ прилетает WAF-заглушка «Site Maintenance», и экстрактор падает с
-# «Unexpected response from webpage request». Поэтому перебираем браузеры сами.
+# ── Pinning the curl_cffi impersonate target ────────────────────────────────
+# The TikTok extractor asks for any target and yt-dlp picks the newest Chrome.
+# Sites periodically ban a TLS fingerprint and answer with a WAF stub
+# ("Unexpected response from webpage request"), so we cycle browsers ourselves.
 _IMPERSONATE_CLIENTS = ("firefox", "safari", "chrome")
-# Скачивания идут в разных потоках (asyncio.to_thread) — таргет попытки храним
-# в thread-local, иначе параллельные запросы перетирали бы выбор друг друга.
+# Downloads run in parallel threads, so the target is thread-local.
 _pinned = threading.local()
 
 
 def _install_impersonate_pinning() -> bool:
-    """Учит yt-dlp спрашивать наш таргет вместо «первого попавшегося».
+    """Makes yt-dlp resolve the pinned target instead of the first available.
 
-    Публичного API нет: параметр impersonate экстрактор перекрывает своим
-    wildcard-таргетом — поэтому патчим внутренний _resolve_target. yt-dlp
-    обновляется nightly на каждом старте, так что при любой неожиданности
-    молча остаёмся на дефолтном поведении.
+    No public API: the extractor overrides the impersonate option with a
+    wildcard, so this patches the internal _resolve_target. yt-dlp updates
+    nightly; on any surprise the default behaviour stays.
     """
     try:
         from yt_dlp.networking.impersonate import ImpersonateRequestHandler
     except ImportError:
-        return False  # curl_cffi не установлен — impersonation не используется
+        return False  # no curl_cffi, no impersonation
 
     original = ImpersonateRequestHandler._resolve_target
 
     def _resolve_target(self, target):
         pinned = getattr(_pinned, "target", None)
-        # Подменяем только wildcard (client=None); явно запрошенный таргет не трогаем.
+        # Only the wildcard (client=None) is replaced, never an explicit target.
         if pinned is not None and target is not None and target.client is None:
             return original(self, pinned) or original(self, target)
         return original(self, target)
@@ -306,7 +284,7 @@ _IMPERSONATE_PINNING = _install_impersonate_pinning()
 
 
 def _impersonate_candidates() -> list:
-    """Таргеты для попыток: по самому свежему на браузер + дефолт yt-dlp в конце."""
+    """Targets to try: the newest per browser, then yt-dlp's default."""
     if not _IMPERSONATE_PINNING:
         return [None]
     try:
@@ -318,51 +296,39 @@ def _impersonate_candidates() -> list:
         return [None]
 
 
-# ── Ошибки: с языка yt-dlp на человеческий ──────────────────────────────────
-# yt-dlp пишет для того, кто запускает его руками: «ERROR: [Instagram] C1zz:
-# Instagram sent an empty media response. Check if this post is accessible in
-# your browser without being logged-in. If it is...». Пользователю бота нужен
-# короткий понятный ответ, поэтому режем служебный префикс «ERROR: [Экстрактор]
-# <id>:» и переводим известные случаи.
+# ── Errors: yt-dlp's wording to the user's ──────────────────────────────────
+# yt-dlp writes for someone running it by hand. The "ERROR: [Extractor] <id>:"
+# prefix is stripped and known cases get short messages.
 _YTDLP_PREFIX_RE = re.compile(r"^ERROR:\s*(?:\[[^\]]+\]\s*)?(?:[\w.-]+:\s+)?")
 
-# Признаки того, что нужен логин/свежие cookies (auth=True → повод сказать
-# владельцу, что пора обновить cookies.txt).
+# A login or fresh cookies are needed.
 _AUTH_MARKERS = (
     "login", "log in", "sign in", "rate-limit", "rate limit", "private",
     "empty media response", "requires authentication", "not a bot",
-    # Подсказка yt-dlp «Use --cookies… for the authentication»: так гостю
-    # отвечают на сторис Instagram («This content is unreachable»).
+    # yt-dlp's "Use --cookies… for the authentication": Instagram stories for guests.
     "for the authentication",
-    # Рилс с ограничением аудитории (возраст и т.п.): гостю «This content isn't
-    # available to everyone: It can't be seen by certain audiences», а под
-    # сессией он качается (проверено 2026-11-07).
+    # Audience-restricted reels: refused to guests, served under the session.
     "available to everyone",
 )
 
-# Так наш плагин Instagram называет ответ API «на страницу логина» под
-# сессией: протухли именно cookies, а не пост закрыт.
+# Our Instagram plugin's error for an API redirect to login under the session.
 _SESSION_EXPIRED_MARKERS = ("session expired",)
 
-# Симптомы «страницу поста нам не отдали»: редирект на главную, страница-
-# заготовка без данных поста, 404 на весь домен. Так выглядит и закрытый пост,
-# и — что важнее — негодная сессия из cookies.txt (Threads на неё отвечает так
-# даже для публичных постов). Отсюда флаг no_post и откат в _extract_info.
+# The post page wasn't served. Looks the same for a hidden post and a bad
+# session (Threads answers a bad session so even for public posts).
 _NO_POST_MARKERS = (
     "hidden from logged-out", "could not find post data", "http error 404",
 )
 
-# «Пост есть, медиа нет» — текст плагина Threads. Отсюда флаг no_media.
+# The Threads plugin's "post without media".
 _NO_MEDIA_MARKERS = ("has no photo or video",)
 
-# Так TikTok-экстрактор падает, когда WAF ответил заглушкой на TLS-отпечаток
-# («Site Maintenance» или JS-челлендж вместо страницы). Отсюда флаг waf.
+# The TikTok extractor's failure on a WAF stub or JS challenge.
 _WAF_MARKERS = ("unexpected response from webpage request", "challenge")
 
-# (маркеры в тексте yt-dlp) → что показать. Первое совпадение выигрывает,
-# поэтому конкретные случаи идут раньше общих.
+# (markers in yt-dlp's text) → message. First match wins: specific cases first.
 _ERROR_MESSAGES = (
-    # Свои сообщения из плагина Threads уже человеческие — не портим их общими.
+    # The Threads plugin's own messages.
     (("quoted post holding the media",),
      "This post quotes another one, and that post is unavailable — "
      "deleted, or not shown to logged-out visitors."),
@@ -371,11 +337,11 @@ _ERROR_MESSAGES = (
      "or visible only to logged-in users."),
     (("has no photo or video",),
      "This post is text only — no photo or video in it."),
-    # Плагин Instagram: сторис по ссылке нет (они живут 24 ч). Не ошибка логина.
+    # Our Instagram plugin: the story expired (24 h). Not a login error.
     (("instagram story is gone",),
      "This story is no longer available — stories disappear after 24 hours, "
      "and deleted ones or ones from private accounts can't be downloaded."),
-    # Эфиры, которые YouTube не отдаёт сам (идущий без записи, будущая премьера).
+    # Lives YouTube won't serve: no recording yet, upcoming premiere.
     (("live stream recording is not available", "live event will begin", "premieres in"),
      _LIVE_MESSAGE),
     (("unsupported url", "no suitable extractor"),
@@ -399,13 +365,13 @@ _ERROR_MESSAGES = (
 
 
 def _raw_error(e: Exception) -> str:
-    # Последняя строка: у yt-dlp там суть, выше — трассировка.
+    # The last line holds the point; above it is the traceback.
     lines = str(e).splitlines()
     return lines[-1].strip() if lines else ""
 
 
 def _cookies_name(site: str | None) -> str:
-    """Как ошибки называют cookies площадки: «instagram.com cookies»."""
+    """How errors name a site's cookies: "instagram.com cookies"."""
     return f"{_SITES[site][0]} cookies" if site in _SITES else "cookies for this site"
 
 
@@ -413,15 +379,13 @@ def _as_download_error(e: Exception, site: str | None = None) -> DownloadError:
     clean = _YTDLP_PREFIX_RE.sub("", _raw_error(e))
     low = clean.lower()
 
-    # Признак «страницы поста не было» считаем по тексту yt-dlp, а не по нашему
-    # переводу: перевод человеческий и нужных слов в нём может не остаться.
+    # Flags come from yt-dlp's text: the translation may lose the words.
     no_post = any(marker in low for marker in _NO_POST_MARKERS)
     no_media = any(marker in low for marker in _NO_MEDIA_MARKERS)
     waf = any(marker in low for marker in _WAF_MARKERS)
 
-    # Ошибки доступа — проблема cookies, так прямо и пишем. Этот текст доходит
-    # до пользователя, только когда cookies площадки были в запросе: без них
-    # _extract_info заменяет его на «у бота нет cookies».
+    # Access errors are cookie problems. Without the site's cookies in the
+    # request, _extract_info replaces this with "the bot has no cookies".
     cookies = _cookies_name(site)
     if any(marker in low for marker in _SESSION_EXPIRED_MARKERS):
         return DownloadError(
@@ -439,23 +403,20 @@ def _as_download_error(e: Exception, site: str | None = None) -> DownloadError:
         if any(marker in low for marker in markers):
             return DownloadError(text, no_post=no_post, no_media=no_media, waf=waf)
 
-    # Неизвестный случай — отдаём текст yt-dlp, но без служебного префикса и
-    # без простыни на пол-экрана.
+    # Unknown case: yt-dlp's own text, capped.
     if len(clean) > 200:
         clean = clean[:199].rstrip() + "…"
     return DownloadError(f"Couldn't download it: {clean}", no_post=no_post, waf=waf)
 
 
-# ── cookies.txt: замена по сайту ────────────────────────────────────────────
-# Экспорт из браузера делается по одному сайту, а файл у бота один на все
-# площадки. Перезапись целиком убивала бы cookies остальных сайтов, поэтому
-# заменяем записи только тех сайтов, что есть в новом экспорте.
+# ── cookies.txt: per-site replacement ───────────────────────────────────────
+# One file serves all sites, so an upload replaces only the sites it contains.
 _COOKIE_HEADER = "# Netscape HTTP Cookie File\n"
 _HTTPONLY_PREFIX = "#HttpOnly_"
 
 
 def _cookie_key(line: str) -> tuple[str, str, str] | None:
-    """(домен, путь, имя) для строки Netscape-формата; None — если не запись."""
+    """(domain, path, name) of a Netscape-format record, or None."""
     parts = line.rstrip("\n").split("\t")
     if len(parts) != 7:
         return None
@@ -468,22 +429,17 @@ def _cookie_key(line: str) -> tuple[str, str, str] | None:
 
 
 def _site_domain(domain: str) -> str:
-    """Домен записи без ведущей точки и www.: «.www.threads.com» → «threads.com»."""
+    """Domain without the leading dot and www.: ".www.threads.com" → "threads.com"."""
     domain = domain.lstrip(".")
     return domain[4:] if domain.startswith("www.") else domain
 
 
 def merge_cookies_file(upload_path: str, target_path: str) -> list[str]:
-    """Заменяет в target_path cookies сайтов из upload_path; возвращает эти сайты.
+    """Replaces the cookies of upload_path's sites in target_path; returns the sites.
 
-    Экспорт браузера — полный снимок cookies сайта, поэтому старые записи этих
-    сайтов (и их поддоменов) выбрасываем целиком, а не сливаем по имени: иначе
-    в файле оставался бы, например, старый sessionid, когда свежий экспорт
-    сделан из разлогиненного браузера. Записи остальных сайтов не трогаем.
-
-    Пустой список = в загруженном файле нет ни одной валидной записи (прислали
-    не Netscape-формат). Рабочий файл при этом не тронут — вызывающий обязан
-    проверить результат, иначе кривой экспорт стирал бы живые cookies.
+    An export is a full snapshot, so old records of its sites are dropped, not
+    merged by name: a logged-out export must remove an old sessionid.
+    An empty list means no valid records and target_path is untouched.
     """
     with open(upload_path, encoding="utf-8", errors="replace") as f:
         incoming = [(key, line) for line in f if (key := _cookie_key(line))]
@@ -501,15 +457,14 @@ def merge_cookies_file(upload_path: str, target_path: str) -> list[str]:
         with open(target_path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 key = _cookie_key(line)
-                # Шапку и комментарии пересобираем сами; записи сайтов из
-                # экспорта заменяются его записями целиком.
+                # The header is rewritten; the upload's sites are replaced.
                 if key is None or replaced(key[0]):
                     continue
                 lines.append(line)
     lines.extend(line for _, line in incoming)
 
-    # Пишем НА МЕСТО (не через rename): файл лежит на общем с Bot API server
-    # volume, и подмена инода сменила бы владельца — бот потерял бы доступ.
+    # In place, not via rename: on the volume shared with the Bot API server a
+    # new inode would change the owner and lock the bot out.
     with open(target_path, "w", encoding="utf-8") as f:
         f.write(_COOKIE_HEADER)
         for line in lines:
@@ -517,23 +472,20 @@ def merge_cookies_file(upload_path: str, target_path: str) -> list[str]:
     return sorted(sites)
 
 
-# Instagram и Threads качаем сначала гостем, а сессией из cookies.txt — только
-# то, что гостю не отдали (сторис, закрытые аккаунты, скрытые от гостей посты).
-# Сессия — живой аккаунт, и каждый запрос под ним засчитывается ему: бот открыт
-# всем, раньше все ссылки шли через сессию, и 2026-11-06 Instagram залочил
-# аккаунт владельца за автоматическую активность. Гостю публичные посты,
-# рилсы и карусели отдаются; у Threads гостевой HTML ещё и полнее приватного
-# API (в API у цитат бывает пусто, гостю они приходят с видео).
+# Instagram and Threads go as a guest first; the cookies.txt session is only for
+# what guests don't get (stories, private accounts, hidden posts). Every session
+# request counts against a real account: with all links of this public bot going
+# through it, Instagram locked the owner's account (2026-11-06).
 _GUEST_FIRST_SITES = ("instagram", "threads")
-# Запись сессии у обеих площадок; без неё «под cookies» — тот же гость.
+# Both sites' session cookie; without it a request is anonymous anyway.
 _SESSION_COOKIE = "sessionid"
 
 
 def _has_session(cookiefile: str | None, site: str | None) -> bool:
-    """Есть ли в cookies.txt вход на площадку.
+    """Whether cookies.txt holds a login for the site.
 
-    У Instagram и Threads это sessionid на её домене. У остальных — любые её
-    cookies: имя сессии у них своё, а разлогиненный экспорт не отличить.
+    Instagram and Threads: a sessionid on the site's domain. Others: any of
+    their cookies, since session cookie names differ.
     """
     if not cookiefile or site not in _SITES:
         return False
@@ -550,15 +502,14 @@ def _has_session(cookiefile: str | None, site: str | None) -> bool:
                 if any(d == s or d.endswith("." + s) for s in domains):
                     return True
     except OSError:
-        logger.exception("Не удалось прочитать cookies")
+        logger.exception("Couldn't read cookies")
     return False
 
 
 def _no_cookies_error(site: str | None, cause: DownloadError) -> DownloadError:
-    """Площадка просит логин, а cookies для неё у бота нет — так и пишем.
+    """The site wants a login and the bot has no cookies for it.
 
-    auth=False: владельцу напоминать нечего — cookies он убрал сам или ещё не
-    загружал.
+    auth stays False: there's nothing for the owner to renew.
     """
     what = (" (a story, a private account, or a post hidden from logged-out visitors)"
             if site in _GUEST_FIRST_SITES else "")
@@ -570,7 +521,7 @@ def _no_cookies_error(site: str | None, cause: DownloadError) -> DownloadError:
 
 
 def _extract_info(opts: dict, url: str) -> dict:
-    """extract_info; Instagram и Threads — гостем, а не вышло — под сессией."""
+    """extract_info; Instagram and Threads as a guest first, then under the session."""
     site = site_of(url)
     cookiefile = opts.get("cookiefile")
     if site not in _GUEST_FIRST_SITES:
@@ -583,15 +534,11 @@ def _extract_info(opts: dict, url: str) -> dict:
     try:
         return _extract_info_attempts({**opts, "cookiefile": None}, url)
     except DownloadError as guest:
-        # Сессия может помочь, только если гостю не хватило прав (auth), пост
-        # от гостя скрыт (no_post) или отдан урезанным (no_media). Удалённое
-        # видео, таймаут, лимит размера под сессией будут теми же.
+        # The session only helps with access, hidden or stripped posts.
         if not (guest.auth or guest.no_post or guest.no_media):
             raise
         if not _has_session(cookiefile, site):
-            # Сессии нет — владелец её убрал или ещё не загрузил. Напоминать
-            # ему про cookies незачем (auth=False), а пользователю — прямо, что
-            # дело в cookies.
+            # No session: no reminder for the owner; the user is told it's cookies.
             if guest.auth:
                 raise _no_cookies_error(site, guest) from guest
             if guest.no_post:
@@ -602,15 +549,14 @@ def _extract_info(opts: dict, url: str) -> dict:
                     no_post=True,
                 ) from guest
             raise
-        logger.info("%s: гостем не вышло (%s) — пробую под сессией", site, guest)
+        logger.info("%s: guest attempt failed (%s), trying the session", site, guest)
         try:
             return _extract_info_attempts(opts, url)
         except DownloadError as e:
             if e.auth or not e.no_post:
                 raise
-            # Страницу поста не отдали и под сессией. Пост может быть правда
-            # удалён или закрыт, но сессия не помогла — владельцу стоит её
-            # проверить (Threads на негодную сессию отвечает именно так).
+            # Not served under the session either: deleted, or a bad session
+            # (Threads answers so), which the owner should check.
             raise DownloadError(
                 "The site didn't hand over this post, as a guest or with the saved "
                 f"{_cookies_name(site)}: it's deleted, or it's a cookie problem — "
@@ -620,13 +566,10 @@ def _extract_info(opts: dict, url: str) -> dict:
 
 
 def _extract_info_attempts(opts: dict, url: str) -> dict:
-    """extract_info; для TikTok — с перебором impersonate-таргетов.
+    """extract_info; for TikTok, cycling impersonate targets on WAF errors.
 
-    Перебор нужен только TikTok и только когда его WAF отверг TLS-отпечаток
-    (флаг waf). Остальные площадки impersonation не просят, и повтор лишь
-    множит запросы: Instagram за это режет rate-limit'ом, Threads отвечает
-    страницей без данных поста, а удалённое видео отвечало бы ошибкой вчетверо
-    дольше.
+    Elsewhere retries only add requests: Instagram rate-limits, Threads serves
+    empty pages.
     """
     site = site_of(url)
     candidates = _impersonate_candidates() if site == "tiktok" else [None]
@@ -637,16 +580,15 @@ def _extract_info_attempts(opts: dict, url: str) -> dict:
                 return ydl.extract_info(url, download=True)
         except yt_dlp.utils.DownloadError as e:
             err = _as_download_error(e, site)
-            # Сырой текст yt-dlp — в лог: пользователю уходит перевод, а по
-            # переводу причину не восстановить.
+            # The raw text goes to the log: the user's message loses the cause.
             logger.warning(
-                "yt-dlp: не вышло %s (попытка %d/%d, таргет %s): %s",
-                url, attempt, len(candidates), target or "по умолчанию", _raw_error(e))
+                "yt-dlp failed %s (attempt %d/%d, target %s): %s",
+                url, attempt, len(candidates), target or "default", _raw_error(e))
             if not err.waf or attempt == len(candidates):
                 raise err from e
         finally:
             _pinned.target = None
-    raise DownloadError("Couldn't download it.")  # сюда не попадаем
+    raise DownloadError("Couldn't download it.")  # unreachable
 
 
 def _to_int(value: object) -> int | None:
@@ -657,12 +599,10 @@ def _to_int(value: object) -> int | None:
 
 
 def _cookies_for_run(config: Config, work_dir: str) -> str | None:
-    """Одноразовая копия cookies.txt на время скачивания (её и скармливаем yt-dlp).
+    """A one-off copy of cookies.txt for this download.
 
-    yt-dlp по завершении пишет cookie-jar ОБРАТНО в файл, и ответ площадки с
-    Set-Cookie правит рабочий файл. Для Threads это опасно: отвергнутый запрос
-    он сопровождает разлогином — и строка `sessionid` навсегда исчезает из
-    cookies.txt бота (проверено). Оригинал меняет только владелец загрузкой.
+    yt-dlp writes the cookie jar back to the file, and Threads answers a refused
+    request with a logout that would erase sessionid from the bot's file.
     """
     src = config.cookies_file
     if not src or not os.path.isfile(src):
@@ -672,7 +612,7 @@ def _cookies_for_run(config: Config, work_dir: str) -> str | None:
         shutil.copyfile(src, dst)
         os.chmod(dst, 0o600)
     except OSError:
-        logger.exception("Не удалось скопировать cookies — качаю без них")
+        logger.exception("Couldn't copy cookies, downloading without them")
         return None
     return dst
 
@@ -682,7 +622,7 @@ def _is_live(info: dict) -> bool:
 
 
 def _skip_live(info: dict, *, incomplete: bool = False) -> str | None:
-    """match_filter для yt-dlp: эфир не качать (причину вернёт _reject_live)."""
+    """yt-dlp match_filter: skip lives (_reject_live explains why)."""
     return "live stream" if _is_live(info) else None
 
 
@@ -693,12 +633,9 @@ def _reject_live(info: dict) -> None:
 
 def _build_opts(config: Config, out_template: str, url: str, work_dir: str) -> dict:
     opts: dict = {
-        # У вертикальных видео «1080p» = 1080x1920, т.е. height=1920 — поэтому
-        # ограничиваем ДЛИННУЮ сторону (<=1920), иначе height<=1080 резал их до 540p.
+        # Vertical 1080p is 1080x1920, so the longer side is capped.
         "format": "bv*[height<=1920][width<=1920]+ba/b[height<=1920][width<=1920]/b",
-        # Предпочитаем H.264 (Telegram играет только его; иначе перекодируем),
-        # затем 1080p, затем AAC: Opus, который YouTube отдаёт к H.264, пришлось
-        # бы перекодировать. Нативные H.264+AAC не требуют перекодирования.
+        # H.264 and AAC first: Telegram needs them, and native ones skip re-encoding.
         "format_sort": ["vcodec:h264", "res:1080", "acodec:aac"],
         "outtmpl": out_template,
         "merge_output_format": "mp4",
@@ -710,23 +647,20 @@ def _build_opts(config: Config, out_template: str, url: str, work_dir: str) -> d
         "retries": 3,
         "concurrent_fragment_downloads": 4,
         "max_filesize": config.max_file_size_bytes,
-        # Медиа одного поста, а заодно страховка: любой «плейлист» — не больше
-        # MAX_POST_ITEMS, даже если площадка неожиданно отдаст список.
+        # Also caps any unexpected playlist.
         "playlistend": MAX_POST_ITEMS,
-        # Эфир не скачивается вовсе; объяснение — в _reject_live после извлечения.
         "match_filter": _skip_live,
     }
-    # Карусели Instagram/Threads — это «плейлист» из нескольких медиа.
+    # Instagram/Threads carousels are playlists.
     if site_of(url) in ("instagram", "threads"):
         opts["noplaylist"] = False
-    # Передаём cookies только если файл реально есть (его могли ещё не загрузить).
     if cookies := _cookies_for_run(config, work_dir):
         opts["cookiefile"] = cookies
     return opts
 
 
 def _collect_media(work_dir: str) -> list[str]:
-    """Собирает финальные медиафайлы из папки запроса (после merge/скачивания)."""
+    """Final media files in the request folder."""
     files = []
     for path in sorted(glob.glob(os.path.join(work_dir, "*"))):
         if not os.path.isfile(path):
@@ -740,7 +674,7 @@ def _collect_media(work_dir: str) -> list[str]:
 
 
 def _probe_video(path: str) -> dict:
-    """codec/pix_fmt/размеры/длительность видеопотока и кодек звука (ffprobe)."""
+    """Video codec, pix_fmt, size and duration, plus the audio codec (ffprobe)."""
     try:
         out = subprocess.run(
             [
@@ -767,16 +701,14 @@ def _probe_video(path: str) -> dict:
 
 
 def _ensure_telegram_playable(path: str) -> str:
-    """Приводит видео к тому, что Telegram играет везде: H.264 8-bit + AAC/MP3 в MP4.
+    """Converts a video to what Telegram plays everywhere: 8-bit H.264 + AAC/MP3 in MP4.
 
-    Годное не трогаем (нет нагрузки на CPU). Видео перекодируем только для
-    VP9/HEVC/AV1/10-bit — их на телефоне не видно; если не подходит лишь звук
-    (Opus с YouTube) — только звук, это секунды. Возвращает путь к итоговому
-    .mp4: у перекодированного WebM расширение тоже меняется на .mp4.
+    Fit files are left alone; only the failing stream is re-encoded.
+    Returns the final .mp4 path.
     """
     meta = _probe_video(path)
     video_ok = meta.get("codec") == _TELEGRAM_VCODEC and meta.get("pix") in _TELEGRAM_PIX
-    audio_ok = meta.get("acodec") in (None, *_TELEGRAM_ACODECS)  # None — звука нет
+    audio_ok = meta.get("acodec") in (None, *_TELEGRAM_ACODECS)  # None: no audio
     base, ext = os.path.splitext(path)
     if video_ok and audio_ok and ext.lower() == ".mp4":
         return path
@@ -791,8 +723,8 @@ def _ensure_telegram_playable(path: str) -> str:
     ]
     try:
         subprocess.run(cmd, check=True, timeout=600, capture_output=True)
-    except Exception:  # noqa: BLE001  — не смогли перекодировать, отдаём как есть
-        logger.warning("Не удалось привести %s к H.264/AAC — отправляю как есть",
+    except Exception:  # noqa: BLE001
+        logger.warning("Couldn't convert %s to H.264/AAC, sending as is",
                        os.path.basename(path), exc_info=True)
         if os.path.exists(out):
             os.remove(out)
@@ -806,7 +738,7 @@ def _ensure_telegram_playable(path: str) -> str:
 
 def _download_blocking(url: str, config: Config, work_dir: str) -> DownloadResult:
     url = _resolve_share_link(_normalize_url(url))
-    # autonumber сохраняет порядок элементов карусели
+    # autonumber keeps the carousel order
     out_template = os.path.join(work_dir, "%(autonumber)03d-%(id)s.%(ext)s")
     opts = _build_opts(config, out_template, url, work_dir)
 
@@ -820,7 +752,7 @@ def _download_blocking(url: str, config: Config, work_dir: str) -> DownloadResul
             f"{config.max_file_size_mb} MB limit."
         )
 
-    # Метаданные элементов по id — для подписей трека (имя файла: NNN-<id>.<ext>).
+    # Item metadata by id, for track tags (file name: NNN-<id>.<ext>).
     entries = {e["id"]: e for e in info.get("entries") or [info] if e and e.get("id")}
     items = []
     for f in files:
@@ -833,7 +765,6 @@ def _download_blocking(url: str, config: Config, work_dir: str) -> DownloadResul
             item.performer = entry.get("artist")
             item.duration = _to_int(entry.get("duration"))
         if is_video:
-            # Гарантируем H.264 (перекодируем VP9/HEVC/AV1), берём размеры из файла.
             item.path = _ensure_telegram_playable(f)
             meta = _probe_video(item.path)
             item.width = meta.get("w")
@@ -853,8 +784,7 @@ def _download_blocking(url: str, config: Config, work_dir: str) -> DownloadResul
             f"{config.max_file_size_mb} MB limit."
         )
 
-    # Текст поста: у одиночных видео лежит в description; у плейлистов (карусели)
-    # yt-dlp может держать его только в элементах — берём из первого непустого.
+    # Carousels may keep the caption only in their items.
     description = info.get("description") or ""
     if not description:
         for entry in info.get("entries") or []:
@@ -871,28 +801,23 @@ def _download_blocking(url: str, config: Config, work_dir: str) -> DownloadResul
 
 
 async def download(url: str, config: Config, work_dir: str) -> DownloadResult:
-    """Асинхронная обёртка — yt-dlp блокирующий, гоняем в thread pool."""
+    """yt-dlp blocks, so it runs in a thread."""
     return await asyncio.to_thread(_download_blocking, url, config, work_dir)
 
 
-# ── Нарезка: качаем с площадки только нужные куски ──────────────────────────
+# ── Cutting: only the requested pieces are downloaded ───────────────────────
 
 
 @dataclass
 class ClipsResult:
     duration: int | None = None
-    # Номер диапазона (как в запросе) → готовый клип либо текст ошибки.
-    # Диапазонов, что начинаются за концом видео, нет ни там, ни там.
+    # Range index → clip or error. Ranges starting past the end are in neither.
     clips: dict[int, MediaItem] = field(default_factory=dict)
     errors: dict[int, str] = field(default_factory=dict)
 
 
 def _clip_sections(ranges: list[tuple[int, int]]) -> Callable:
-    """download_ranges для yt-dlp: наши диапазоны, кроме тех, что за концом видео.
-
-    Конец диапазона yt-dlp сам обрезает по длительности; кусок, начинающийся
-    за концом, сломал бы ffmpeg — поэтому его отсеиваем здесь, зная duration.
-    """
+    """yt-dlp download_ranges without ranges starting past the end (they break ffmpeg)."""
     def sections(info: dict, ydl: yt_dlp.YoutubeDL) -> list[dict]:
         dur = info.get("duration")
         return [
@@ -909,28 +834,25 @@ def _download_clips_blocking(
     work_dir: str,
     ranges: list[tuple[int, int]],
 ) -> ClipsResult:
-    """Качает с площадки только куски ranges, а не всё видео.
+    """Downloads only the requested pieces, not the whole video.
 
-    Режет сам yt-dlp (download_ranges): ffmpeg читает с площадки ровно нужный
-    отрезок. force_keyframes_at_cuts отключает копирование потоков, и с нашими
-    аргументами вывода ffmpeg сразу кодирует кусок в H.264/AAC: рез точный по
-    кадру, клип готов для Telegram. Раньше видео качалось целиком и без лимита
-    размера — «0:00-0:05» по многочасовому стриму стоило гигабайты.
+    ffmpeg reads just each span; force_keyframes_at_cuts disables stream copy, so
+    our output args encode a frame-accurate H.264/AAC clip directly.
     """
     url = _resolve_share_link(_normalize_url(url))
     out_template = os.path.join(work_dir, "clip-%(section_number)03d.%(ext)s")
     opts = _build_opts(config, out_template, url, work_dir)
-    opts.pop("max_filesize", None)  # размер куска заранее не известен — проверяем после
+    opts.pop("max_filesize", None)  # checked per piece below
     opts.update({
         "noplaylist": True,
         "download_ranges": _clip_sections(ranges),
         "force_keyframes_at_cuts": True,
         "external_downloader_args": {
-            # -rw_timeout (мкс): зависшее соединение роняет ffmpeg, а не вешает задачу.
+            # -rw_timeout (µs): a stalled connection fails ffmpeg instead of hanging.
             "ffmpeg_i": ["-rw_timeout", "30000000"],
             "ffmpeg_o": [*_H264_ARGS, *_AAC_ARGS, "-movflags", "+faststart"],
         },
-        # Сбой одного куска не роняет остальные; ошибки извлечения — как обычно.
+        # One failed piece doesn't stop the others.
         "ignoreerrors": "only_download",
     })
 
@@ -950,8 +872,7 @@ def _download_clips_blocking(
             os.remove(path)
             result.errors[i] = "came out empty, the timecodes are outside the video"
             continue
-        # Клип уже H.264/AAC — проверка почти бесплатна, но страхует от
-        # нестандартного источника (например, WebM без mp4-форматов).
+        # Cheap guard for odd sources (WebM without mp4 formats).
         path = _ensure_telegram_playable(path)
         if os.path.getsize(path) > config.max_file_size_bytes:
             os.remove(path)

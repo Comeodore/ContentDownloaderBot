@@ -1,4 +1,4 @@
-"""Конфигурация бота из переменных окружения."""
+"""Bot configuration from environment variables."""
 import os
 from dataclasses import dataclass
 
@@ -23,7 +23,7 @@ class Config:
 
     @property
     def is_local_server(self) -> bool:
-        """True, если ходим через свой Bot API server (path-режим без аплоада)."""
+        """Using our own Bot API server (files are passed by path, not uploaded)."""
         return bool(self.telegram_api_base)
 
 
@@ -31,11 +31,10 @@ def load_config() -> Config:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError(
-            "BOT_TOKEN не задан. Скопируй .env.example в .env и впиши токен от @BotFather."
+            "BOT_TOKEN is not set. Copy .env.example to .env and put the @BotFather token in it."
         )
 
-    # Путь к cookies храним как задан в env (без проверки наличия) — файл может
-    # появиться позже через owner-flow. Наличие проверяет downloader при скачивании.
+    # Not checked for existence: the owner may upload the file later.
     cookies = os.getenv("COOKIES_FILE", "").strip() or None
 
     api_base = os.getenv("TELEGRAM_API_BASE", "").strip() or None

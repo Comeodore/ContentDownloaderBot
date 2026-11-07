@@ -1,16 +1,12 @@
-"""Плагин-экстрактор Threads (threads.com / threads.net) для yt-dlp.
+"""yt-dlp extractor plugin for Threads (threads.com / threads.net).
 
-В самом yt-dlp поддержки Threads пока нет (PR yt-dlp/yt-dlp#9852 не смержен).
-Это адаптация того PR под механизм плагинов: абсолютные импорты, домен
-threads.com (threads.net теперь редиректит на него), карусель — как плейлист,
-чтобы бот отправлял её альбомом. Сверх PR добавлены фото (в самом PR только
-видео), медиа из процитированного/репостнутого поста и из ссылки на рилс
-Instagram, которую Threads разворачивает прямо в посте, и распознавание
-недоступного поста. Когда экстрактор появится в апстриме, этот файл можно
-удалить — но фото проверь, их там может не быть.
+yt-dlp has no Threads support yet (PR yt-dlp/yt-dlp#9852 is unmerged). This is
+that PR adapted to the plugin system, plus photos, media from quoted/reposted
+posts and inline Instagram reels, and unavailable-post detection. If upstream
+gains an extractor, drop this file, but check it handles photos first.
 
-yt-dlp находит плагин автоматически: пакет `yt_dlp_plugins` лежит в корне
-проекта, а бот запускается из него (корень попадает в sys.path).
+yt-dlp finds it because the bot runs from the project root, which holds the
+`yt_dlp_plugins` package.
 """
 import re
 
@@ -28,22 +24,20 @@ from yt_dlp.utils import (
 from yt_dlp_plugins.extractor._images import best_image
 
 _BASE_URL = 'https://www.threads.com/'
-# X-IG-App-ID веб-клиента Threads: без него приватный API отвечает 302 на логин.
-# Значение лежит в любой странице threads.com (RelayAPIConfigDefaults.customHeaders).
+# Threads web client's X-IG-App-ID; without it the private API redirects to login.
+# Found on any threads.com page (RelayAPIConfigDefaults.customHeaders).
 _WEB_APP_ID = '238260118697367'
-# Алфавит шорткодов Instagram/Threads: код поста — это его numeric pk в base64url.
+# Shortcode alphabet: a post code is its numeric pk in base64url.
 _CODE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
 
 
-# Пост может быть цитатой или репостом чужого: своих медиа у него нет
-# (media_type 19 — «текст»), а видео лежит во вложенном посте-источнике.
-# Ключи разные для цитаты-вложения, обычной цитаты и репоста — смотрим все.
+# A quote or repost has no media of its own (media_type 19, text); the video is
+# in the source post, under a different key for each kind of share.
 _SHARED_POST_KEYS = ('quoted_attachment_post', 'quoted_post', 'reposted_post')
 
 
 class ThreadsIE(InfoExtractor):
-    # /@user/post/<code> — обычная ссылка; /t/<code> — старая короткая, Threads
-    # редиректит её (301) на обычную. Код поста в обеих один и тот же.
+    # /t/<code> is the old short form; Threads 301s it to /@user/post/<code>.
     _VALID_URL = r'https?://(?:www\.)?threads\.(?:com|net)/(?:(?P<uploader>[^/?#]+)/post|t)/(?P<id>[^/?#&]+)'
 
     _TESTS = [{
@@ -55,7 +49,7 @@ class ThreadsIE(InfoExtractor):
             'uploader_id': 'tntsportsbr',
         },
     }, {
-        # Текст + ссылка на рилс Instagram: видео лежит в linked_inline_media.
+        # Text plus an Instagram reel link: the video is in linked_inline_media.
         'url': 'https://www.threads.com/@zhanginsergei/post/DfNaDpOgK4s',
         'info_dict': {
             'id': 'DfNaDpOgK4s',
@@ -65,7 +59,7 @@ class ThreadsIE(InfoExtractor):
     }]
 
     def _media_entry(self, media, post_code):
-        """Формирует запись для одного медиа поста/карусели: видео или фото."""
+        """Entry for one media item: video, or the largest photo."""
         images = [
             t for t in traverse_obj(media, ('image_versions2', 'candidates')) or []
             if t.get('url')
@@ -88,10 +82,8 @@ class ThreadsIE(InfoExtractor):
                 'thumbnails': thumbnails,
             }
 
-        # Фото-пост или фото внутри карусели: video_versions нет, зато есть
-        # кандидаты картинки разных размеров.
         if not images:
-            return None  # текстовый пост (media_type 19) — качать нечего
+            return None  # text post (media_type 19)
         best = best_image(media, images)
         return {
             'id': str(media.get('pk') or post_code),
@@ -105,7 +97,6 @@ class ThreadsIE(InfoExtractor):
         }
 
     def _entries(self, post, post_code):
-        """Медиа поста: карусель — по элементам, одиночный — сам объект."""
         return [
             entry for media in post.get('carousel_media') or [post]
             if (entry := self._media_entry(media, post_code))
@@ -113,12 +104,11 @@ class ThreadsIE(InfoExtractor):
 
     @staticmethod
     def _shared_post(post):
-        """Вложенный пост-источник цитаты/репоста и признак его недоступности.
+        """The quoted/reposted source post, and whether it is unavailable.
 
-        Гостю Threads такой пост не отдаёт вовсе: ставит *_unavailable и режет
-        медиа — снаружи это выглядит как обычный текстовый пост. Проверено: тот
-        же URL под валидной сессией отдаёт quoted_attachment_post целиком, с
-        video_versions, а анонимно — media_type 19 и пустые кандидаты.
+        Logged out, Threads sets *_unavailable and strips the media, so the post
+        looks like plain text. Verified: the same URL with a valid session
+        returns the full quoted_attachment_post with video_versions.
         """
         share_info = traverse_obj(post, ('text_post_app_info', 'share_info')) or {}
         for key in _SHARED_POST_KEYS:
@@ -127,12 +117,11 @@ class ThreadsIE(InfoExtractor):
         return None, any(share_info.get(f'{key}_unavailable') for key in _SHARED_POST_KEYS)
 
     def _find_post(self, webpage, video_id):
-        """Ищет объект поста в JSON внутри <script> страницы.
+        """Find the post object in the page's <script> JSON.
 
-        Скриптов с "code":"<id>" несколько, и объект поста в них в разных местах:
-        либо сразу в result.data.media, либо в
-        result.data.data.edges[].node.thread_items[].post.
-        Внутри JSON символ "<" экранирован (<), поэтому [^<]* не обрежет его.
+        It sits either in result.data.media or in
+        result.data.data.edges[].node.thread_items[].post. "<" is escaped
+        inside the JSON, so [^<]* doesn't cut it short.
         """
         for mobj in re.finditer(
                 rf'<script[^>]+>([^<]*"code":"{re.escape(video_id)}"[^<]*)</script>', webpage):
@@ -150,24 +139,17 @@ class ThreadsIE(InfoExtractor):
         return None
 
     def _has_session(self):
-        """Есть ли в cookies живая сессия Threads (только с ней работает API)."""
         return bool(self._get_cookies(_BASE_URL).get('sessionid'))
 
     @staticmethod
     def _pk_from_code(code):
-        """Числовой pk медиа из шорткода поста (он же — pk в base64url)."""
         try:
             return decode_base_n(code, table=_CODE_CHARS)
         except ValueError:
             return None
 
     def _api_post(self, video_id, pk=None):
-        """Объект поста из приватного API Threads — нужна сессия в cookies.
-
-        Форма ответа та же, что у объекта из HTML (code / media_type /
-        carousel_media / video_versions / user / caption), так что дальше пост
-        обрабатывается общим кодом. Без сессии API отвечает 302 на логин.
-        """
+        """Post object from the private API (needs a session; same shape as the HTML one)."""
         pk = pk or self._pk_from_code(video_id)
         if not pk:
             return None
@@ -176,25 +158,21 @@ class ThreadsIE(InfoExtractor):
             note='Downloading post from API', errnote='Post API request failed',
             fatal=False, headers={'X-IG-App-ID': _WEB_APP_ID, 'Referer': _BASE_URL})
         post = traverse_obj(data, ('items', 0))
-        # Сверяем code: по чужому pk (например из мусорного редиректа) API
-        # молча отдал бы другой пост.
+        # A wrong pk (e.g. from a junk redirect) would silently return another post.
         return post if post and post.get('code') == video_id else None
 
     def _webpage_post(self, url, video_id):
-        """Объект поста из HTML страницы + сама страница (для метаданных)."""
-        # Threads изредка отдаёт страницу без данных поста — одна повторная
-        # загрузка обычно решает.
+        """Post object from the page HTML, plus the page for metadata."""
+        # Threads sometimes serves a page without post data; one retry usually fixes it.
         for attempt in range(2):
             webpage, urlh = self._download_webpage_handle(
                 url, video_id,
                 note='Downloading webpage' if not attempt else 'Retrying webpage (no post data)')
-            # Недоступный пост (удалён / скрыт от гостей) Threads не отдаёт 404:
-            # молча редиректит на главную (/?error=invalid_post) и присылает
-            # HTTP 200 с чужой лентой. Поэтому смотрим финальный URL, не статус —
-            # иначе поиск данных поста упирался бы в невнятное «no post data».
+            # An unavailable post (deleted / hidden from logged-out visitors) is
+            # not a 404: Threads redirects to /?error=invalid_post with a 200 feed.
             if video_id not in urlh.url:
-                # Но у залогиненного клиента редирект в ленту — это норма, а не
-                # «поста нет»: pk нужного медиа Threads кладёт в injected_media_ids.
+                # Logged in, a redirect to the feed is normal: the media pk is in
+                # injected_media_ids.
                 injected = traverse_obj(parse_qs(urlh.url), ('injected_media_ids', 0)) or ''
                 pk = self._search_regex(r'\d{6,}', injected, 'media id', default=None)
                 post = self._api_post(video_id, pk) if pk else None
@@ -211,11 +189,9 @@ class ThreadsIE(InfoExtractor):
     def _real_extract(self, url):
         video_id = self._match_id(url)
 
-        # Залогиненному клиенту Threads страницу поста не рендерит вовсе: отвечает
-        # 302 в ленту (/?injected_media_ids=["<pk>"]) и отдаёт медиа только через
-        # приватный API. Поэтому при живой сессии сразу идём в API — иначе
-        # обычный редирект выглядел бы как «пост удалён», а закрытые посты
-        # («This content isn't available to everyone») не достать вообще.
+        # Logged in, Threads doesn't render the post page: it 302s to the feed
+        # and serves media only via the private API. So with a session, go to
+        # the API first.
         webpage = None
         post = self._api_post(video_id) if self._has_session() else None
         if not post:
@@ -224,8 +200,7 @@ class ThreadsIE(InfoExtractor):
             raise ExtractorError('Could not find post data', expected=True)
 
         username = traverse_obj(post, ('user', 'username'))
-        # Текст поста берём из caption: он полный и есть на обоих путях, а
-        # <title>/og:description — только у страницы поста (в API-пути её нет).
+        # caption is complete and present on both paths; <title> only on the page.
         caption = strip_or_none(traverse_obj(post, ('caption', 'text')))
         page_title = strip_or_none(
             remove_end(self._html_extract_title(webpage), '• Threads')) if webpage else None
@@ -244,11 +219,8 @@ class ThreadsIE(InfoExtractor):
 
         entries = self._entries(post, video_id)
         if not entries:
-            # Своих медиа нет — значит либо пост правда текстовый, либо он
-            # цитирует/репостит чужой и видео лежит там, либо в тексте ссылка на
-            # рилс/пост Instagram: Threads показывает его плеером прямо в посте, а
-            # сам медиа-объект (той же формы, что пост) кладёт в
-            # linked_inline_media. Он есть и в HTML, и в ответе API.
+            # No own media: a text post, a quote/repost holding the video, or a
+            # linked Instagram reel that Threads embeds as linked_inline_media.
             shared, unavailable = self._shared_post(post)
             linked = traverse_obj(post, ('text_post_app_info', 'linked_inline_media'))
             if shared:
