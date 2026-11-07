@@ -300,61 +300,27 @@ def _log_failure(message: Message, url: str, error: str, cause: str | None = Non
     logger.log(logging.ERROR if exc_info else logging.INFO, line, exc_info=exc_info)
 
 
-# Failure reports to the owner: the same failure at most every 10 min, and at most
-# 20 reports an hour, so a stream of broken links from strangers can't flood them.
-_REPORT_REPEAT_AFTER = 600
-_REPORTS_PER_HOUR = 20
-_reported: dict[tuple[str, str], float] = {}
-_report_times: list[float] = []
-# callback_data of the button under a report.
+# callback_data of the fallback button under a report that couldn't be queued.
 _CLAUDE_BUTTON = "claude"
-# Technical failures go to Claude's queue straight away. The bot is public, so anyone
-# can trigger that with broken links: one session per problem every 6 h, at most 10 a
-# day; beyond that the report keeps the button.
-_AUTO_SAME_PROBLEM_AFTER = 6 * 3600
-_AUTO_PER_DAY = 10
-_auto_sent: dict[str, float] = {}
-_auto_times: list[float] = []
 
 
-def _should_report(url: str, error: str, now: float) -> bool:
-    for key, t in list(_reported.items()):
-        if now - t >= _REPORT_REPEAT_AFTER:
-            del _reported[key]
-    _report_times[:] = [t for t in _report_times if now - t < 3600]
-    if (url, error) in _reported or len(_report_times) >= _REPORTS_PER_HOUR:
-        return False
-    _reported[(url, error)] = now
-    _report_times.append(now)
-    return True
-
-
-def _problem_key(url: str, error: str) -> str:
-    """The site and the error without ids and numbers: one session per problem."""
-    text = re.sub(r"https?://\S+|\b\w*\d\w*\b", "", error.lower())
-    return f"{downloader.site_of(url)}: {' '.join(text.split())[:120]}"
-
-
-def _should_auto_send(url: str, error: str, now: float) -> bool:
-    for key, t in list(_auto_sent.items()):
-        if now - t >= _AUTO_SAME_PROBLEM_AFTER:
-            del _auto_sent[key]
-    _auto_times[:] = [t for t in _auto_times if now - t < 86400]
-    key = _problem_key(url, error)
-    if key in _auto_sent or len(_auto_times) >= _AUTO_PER_DAY:
-        return False
-    _auto_sent[key] = now
-    _auto_times.append(now)
-    return True
+def _user_ref(user) -> str:
+    """The user as a clickable name, @username and id."""
+    if not user:
+        return "?"
+    name = " ".join(filter(None, (getattr(user, "first_name", None),
+                                  getattr(user, "last_name", None)))) or str(user.id)
+    ref = html.quote(name)
+    if isinstance(user.id, int):
+        ref = f'<a href="tg://user?id={user.id}">{ref}</a>'
+    if getattr(user, "username", None):
+        ref += f" @{html.quote(user.username)}"
+    return f"{ref} ({html.quote(str(user.id))})"
 
 
 def _failure_report(message: Message, url: str, error: str, cause: str | None) -> str:
-    user = message.from_user
-    who = "?"
-    if user:
-        who = f"{user.id} (@{user.username})" if user.username else str(user.id)
     lines = ["❌ <b>Download failed</b>",
-             f"<b>User:</b> {html.quote(who)}",
+             f"<b>User:</b> {_user_ref(message.from_user)}",
              f"<b>Link:</b> {html.quote(url)}",
              f"<b>Error:</b> {html.quote(error)}"]
     if cause and cause not in error:
@@ -365,38 +331,31 @@ def _failure_report(message: Message, url: str, error: str, cause: str | None) -
 async def _failure(message: Message, config: Config, url: str, error: str,
                    cause: str | None = None, exc_info: bool = False,
                    user_side: bool = False) -> None:
-    """Logs a failure the user saw and reports it to the owner.
+    """Logs a failure the user saw, reports it to the owner and queues it for Claude.
 
-    A technical failure also goes to Claude's queue at once (within the limits above),
-    and Claude answers under the report; the rest get a Send to Claude button.
+    Claude's worker answers under the report when it's done.
     """
     _log_failure(message, url, error, cause, exc_info=exc_info)
-    now = time.monotonic()
-    if not config.owner_id or not _should_report(url, error, now):
+    if not config.owner_id:
         return
-    auto = not user_side and _should_auto_send(url, error, now)
     text = _failure_report(message, url, error, cause)
-    if auto:
-        text += "\n\n🤖 <i>Sent to Claude automatically</i>"
-    elif user_side:
-        text += "\n\nℹ️ <i>The user's side, nothing to fix</i>"
-    else:
-        text += "\n\n⏸ <i>Auto-send limit reached</i>"
-    button = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🛠 Send to Claude", callback_data=_CLAUDE_BUTTON)]])
+    text += "\n\n🤖 <i>Sent to Claude automatically</i>"
+    if user_side:
+        text += "<i>; looks like the user's side</i>"
     try:
         sent = await message.bot.send_message(
-            config.owner_id, text, link_preview_options=LinkPreviewOptions(is_disabled=True),
-            reply_markup=None if auto else button)
+            config.owner_id, text, link_preview_options=LinkPreviewOptions(is_disabled=True))
     except Exception:  # noqa: BLE001
         logger.exception("Couldn't send the failure report")
         return
-    if auto:
-        try:
-            logger.info("Report queued for Claude: %s",
-                        inbox.add(config, sent.chat.id, sent.message_id, sent.text or text))
-        except OSError:
-            logger.exception("Couldn't queue the report for Claude")
+    try:
+        logger.info("Report queued for Claude: %s",
+                    inbox.add(config, sent.chat.id, sent.message_id, sent.text or text))
+    except OSError:
+        logger.exception("Couldn't queue the report for Claude")
+        with contextlib.suppress(Exception):
+            await sent.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🛠 Send to Claude", callback_data=_CLAUDE_BUTTON)]]))
 
 
 @dp.callback_query(F.data == _CLAUDE_BUTTON)
