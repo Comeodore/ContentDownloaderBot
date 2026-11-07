@@ -334,6 +334,10 @@ _AUTH_MARKERS = (
     # Подсказка yt-dlp «Use --cookies… for the authentication»: так гостю
     # отвечают на сторис Instagram («This content is unreachable»).
     "for the authentication",
+    # Рилс с ограничением аудитории (возраст и т.п.): гостю «This content isn't
+    # available to everyone: It can't be seen by certain audiences», а под
+    # сессией он качается (проверено 2026-11-07).
+    "available to everyone",
 )
 
 # Так наш плагин Instagram называет ответ API «на страницу логина» под
