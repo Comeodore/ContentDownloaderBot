@@ -304,6 +304,19 @@ def _log_failure(message: Message, url: str, error: str, cause: str | None = Non
     logger.log(logging.ERROR if exc_info else logging.INFO, line, exc_info=exc_info)
 
 
+def _log_delivery(message: Message, url: str, queue: float, fetch: float, convert: float,
+                  upload: float, total: float) -> None:
+    """Where a delivered download's time went, in seconds; the Grafana dashboard parses it.
+
+    Format: "Delivered to <id> [@username]: <url> — queue Q s, fetch F s, convert C s,
+    upload U s, total T s". queue is the status message and the wait for a free
+    slot, fetch extraction and download, convert the re-encoding for Telegram.
+    """
+    logger.info("Delivered to %s: %s — queue %.1f s, fetch %.1f s, convert %.1f s, "
+                "upload %.1f s, total %.1f s",
+                _who(message), url, queue, fetch, convert, upload, total)
+
+
 # callback_data of the fallback button under a report that couldn't be queued.
 _CLAUDE_BUTTON = "claude"
 
@@ -397,10 +410,12 @@ async def _report_download_error(
 async def _handle_full(message: Message, config: Config, url: str) -> None:
     # One status for download and upload, no percentages: small files finished
     # before the second edit, and in path mode the upload isn't visible to the bot.
+    started = time.monotonic()
     working_text = f"Downloading {_spinner()}"
     status = await _send_status(message, working_text)
 
     async with _job(status, working_text):
+        slot = time.monotonic()
         os.makedirs(config.download_dir, exist_ok=True)
         work_dir = tempfile.mkdtemp(prefix="vdl_", dir=config.download_dir)
         try:
@@ -414,6 +429,7 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
                                downloader.error_detail(e), exc_info=True)
                 await status.edit_text("❌ " + _STANDARD_ERROR)
                 return
+            fetched = time.monotonic()
             logger.info("Downloaded for %s: %s — %d file(s), %.1f MB", _who(message), url,
                         len(result.items), result.total_size / 1024 / 1024)
 
@@ -424,6 +440,12 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
                 await _failure(message, config, url, "Telegram didn't accept the file",
                                downloader.error_detail(e), exc_info=True)
                 await status.edit_text("❌ " + _STANDARD_ERROR)
+                return
+            done = time.monotonic()
+            _log_delivery(message, url, queue=slot - started,
+                          fetch=fetched - slot - result.convert_seconds,
+                          convert=result.convert_seconds, upload=done - fetched,
+                          total=done - started)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 

@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -113,6 +114,8 @@ class DownloadResult:
     title: str = "video"
     description: str = ""
     total_size: int = 0
+    # Spent re-encoding for Telegram, logged by the bot for the Grafana dashboard.
+    convert_seconds: float = 0.0
 
 
 class DownloadError(Exception):
@@ -774,6 +777,7 @@ def _download_blocking(url: str, config: Config, work_dir: str) -> DownloadResul
     # Item metadata by id, for track tags (file name: NNN-<id>.<ext>).
     entries = {e["id"]: e for e in info.get("entries") or [info] if e and e.get("id")}
     items = []
+    convert_seconds = 0.0
     for f in files:
         ext = os.path.splitext(f)[1].lower()
         is_video = ext in VIDEO_EXTS
@@ -784,7 +788,9 @@ def _download_blocking(url: str, config: Config, work_dir: str) -> DownloadResul
             item.performer = entry.get("artist")
             item.duration = _to_int(entry.get("duration"))
         if is_video:
+            started = time.monotonic()
             item.path = _ensure_telegram_playable(f)
+            convert_seconds += time.monotonic() - started
             meta = _probe_video(item.path)
             item.width = meta.get("w")
             item.height = meta.get("h")
@@ -817,6 +823,7 @@ def _download_blocking(url: str, config: Config, work_dir: str) -> DownloadResul
         title=info.get("title") or "video",
         description=description,
         total_size=total,
+        convert_seconds=convert_seconds,
     )
 
 
