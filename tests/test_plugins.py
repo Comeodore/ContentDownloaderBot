@@ -2,6 +2,7 @@
 import re
 
 import pytest
+import yt_dlp
 from yt_dlp.utils import ExtractorError
 
 import downloader
@@ -84,6 +85,98 @@ def test_dead_session_on_the_api_is_an_error():
 ])
 def test_other_responses_pass_through(url, response, logged_in):
     assert ig._refuse_login_redirect(FakeIE(), url, response, logged_in) is response
+
+
+PROGRESSIVE = "https://scontent-iev1-1.cdninstagram.com/v/reel.mp4?sig=1"
+
+
+def guest_reel(native_url=PROGRESSIVE):
+    """Formats of a guest reel as yt-dlp builds them (2026-11-08)."""
+    return {"id": "r", "formats": [
+        {"url": native_url, "ext": "mp4"},
+        {"url": native_url, "ext": "mp4"},
+        {"format_id": "dash-a", "url": "https://cdn/a.m4a", "ext": "m4a",
+         "vcodec": "none", "acodec": "mp4a.40.5"},
+        {"format_id": "dash-720v", "url": "https://cdn/720.mp4", "ext": "mp4",
+         "vcodec": "vp09.00.31.08", "acodec": "none", "width": 720, "height": 1280},
+        {"format_id": "dash-1080v", "url": "https://cdn/1080.mp4", "ext": "mp4",
+         "vcodec": "vp09.00.40.08", "acodec": "none", "width": 1080, "height": 1920},
+    ]}
+
+
+def fake_probe(meta):
+    calls = []
+
+    def probe(url):
+        calls.append(url)
+        return meta
+    probe.calls = calls
+    return probe
+
+
+H264_720 = {"vcodec": "h264", "acodec": "aac", "width": 720, "height": 1280}
+
+
+def test_native_h264_is_labelled_when_dash_is_vp9_only():
+    probe = fake_probe(H264_720)
+    info = ig._label_native_h264(guest_reel(), probe)
+    assert info["formats"][0] == {"url": PROGRESSIVE, "ext": "mp4", **H264_720}
+    assert info["formats"][1] == info["formats"][0]
+    assert probe.calls == [PROGRESSIVE]  # one probe per file
+
+
+def test_low_res_native_stays_unlabelled():
+    meta = {"vcodec": "h264", "acodec": "aac", "width": 480, "height": 854}
+    info = ig._label_native_h264(guest_reel(), fake_probe(meta))
+    assert "vcodec" not in info["formats"][0]
+
+
+@pytest.mark.parametrize("meta", [None, {**H264_720, "vcodec": "hevc"}])
+def test_unprobed_or_other_codec_stays_unlabelled(meta):
+    info = ig._label_native_h264(guest_reel(), fake_probe(meta))
+    assert "vcodec" not in info["formats"][0]
+
+
+def test_no_probe_when_dash_has_h264():
+    info = guest_reel()
+    info["formats"][3]["vcodec"] = "avc1.64001f"
+    probe = fake_probe(H264_720)
+    ig._label_native_h264(info, probe)
+    assert probe.calls == []
+
+
+def test_no_probe_without_dash_video():
+    probe = fake_probe(H264_720)
+    info = {"id": "r", "formats": [{"url": PROGRESSIVE}]}
+    assert ig._label_native_h264(info, probe) == {"id": "r", "formats": [{"url": PROGRESSIVE}]}
+    assert probe.calls == []
+
+
+@pytest.mark.parametrize("url", [
+    "http://scontent.cdninstagram.com/v.mp4",       # not https
+    "https://192.168.0.1/v.mp4",                     # not Instagram's CDN
+    "https://cdninstagram.com.evil.example/v.mp4",
+    "file:///etc/passwd",
+])
+def test_probe_runs_only_on_instagram_cdn_over_https(monkeypatch, url):
+    def no_run(*a, **k):
+        raise AssertionError("ffprobe must not run")
+    monkeypatch.setattr(ig.subprocess, "run", no_run)
+    assert ig._probe_stream(url) is None
+
+
+def test_bot_format_choice_takes_labelled_native_h264(config, tmp_path):
+    """With the labels, the bot's own format/format_sort pick the native file alone."""
+    opts = downloader._build_opts(config(), "%(id)s.%(ext)s",
+                                  "https://www.instagram.com/reel/r/", str(tmp_path))
+    info = ig._label_native_h264(guest_reel(), fake_probe(H264_720))
+    info.update(title="t", extractor="instagram", extractor_key="Instagram",
+                webpage_url="https://www.instagram.com/reel/r/")
+    ydl_opts = {"format": opts["format"], "format_sort": opts["format_sort"], "quiet": True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        chosen = ydl.process_ie_result(info, download=False)
+    assert chosen["url"] == PROGRESSIVE
+    assert "requested_formats" not in chosen  # no merge with the DASH audio
 
 
 # ── threads ─────────────────────────────────────────────────────────────────
