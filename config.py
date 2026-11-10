@@ -16,8 +16,11 @@ class Config:
     auto_update_hours: int
     download_dir: str
     owner_id: int | None
-    # Owner-only watch queue (watch.py): the channel whose videos it serves.
+    # Owner-only watch queue (watch.py): the channel whose videos it serves,
+    # and the daily time ("12:00", empty = off) the next batch goes out.
     watch_channel_id: int | None = None
+    watch_daily_at: str | None = None
+    watch_tz: str = "UTC"
 
     @property
     def max_file_size_bytes(self) -> int:
@@ -61,4 +64,6 @@ def load_config() -> Config:
         download_dir=os.getenv("DOWNLOAD_DIR", "./downloads").strip() or "./downloads",
         owner_id=owner_id,
         watch_channel_id=_chat_id("WATCH_CHANNEL_ID"),
+        watch_daily_at=os.getenv("WATCH_DAILY_AT", "").strip() or None,
+        watch_tz=os.getenv("WATCH_TZ", "").strip() or "UTC",
     )

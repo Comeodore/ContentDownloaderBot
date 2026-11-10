@@ -397,3 +397,76 @@ def test_old_database_gets_the_new_columns(tmp_path):
     assert store.add(760, "none", None, "Я", T, AUTHOR) is False
     assert store.add(761, "link", REEL, "", T + 5, AUTHOR)
     assert store.queued()[0].note == "Я"
+
+
+# ── The daily batch ─────────────────────────────────────────────────────────
+
+def test_parse_daily():
+    from datetime import time
+    assert watch.parse_daily("12:00") == time(12, 0)
+    assert watch.parse_daily("9:05") == time(9, 5)
+    for bad in ("12", "12:0", "noon", "25:00", "12:60"):
+        with pytest.raises(ValueError):
+            watch.parse_daily(bad)
+
+
+def _kyiv(*args):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime(*args, tzinfo=ZoneInfo("Europe/Kyiv"))
+
+
+def test_daily_due():
+    from datetime import time
+    noon = time(12, 0)
+    today = _kyiv(2026, 11, 10, 0, 0).date().toordinal()
+    assert not watch.daily_due(_kyiv(2026, 11, 10, 11, 59), noon, None)
+    assert watch.daily_due(_kyiv(2026, 11, 10, 12, 0), noon, None)
+    assert watch.daily_due(_kyiv(2026, 11, 10, 14, 0), noon, today - 1)  # caught up after a restart
+    assert not watch.daily_due(_kyiv(2026, 11, 10, 12, 30), noon, today)  # already sent today
+    assert not watch.daily_due(_kyiv(2026, 11, 10, 15, 30), noon, None)  # too late, wait for tomorrow
+
+
+def test_next_daily_and_dst():
+    from datetime import time
+    noon = time(12, 0)
+    assert watch.next_daily(_kyiv(2026, 11, 10, 2, 50), noon) == _kyiv(2026, 11, 10, 12, 0)
+    assert watch.next_daily(_kyiv(2026, 11, 10, 12, 0), noon) == _kyiv(2026, 11, 11, 12, 0)
+    # The night clocks go back (25 Oct 2026): still noon local time.
+    nxt = watch.next_daily(_kyiv(2026, 10, 24, 13, 0), noon)
+    assert nxt == _kyiv(2026, 10, 25, 12, 0) and nxt.utcoffset().total_seconds() == 7200
+
+
+def test_quiet_batch_with_nothing_new_sends_nothing(cfg, store):
+    bot = ChannelBot({})
+    store.set("cursor", 900)
+    store.set("caught_up", 1)
+    assert asyncio.run(watch._batch(bot, cfg, SimpleNamespace(id=OWNER), quiet=True)) is False
+    assert [c[0] for c in bot.calls] == []
+    assert asyncio.run(watch._batch(bot, cfg, SimpleNamespace(id=OWNER))) is False
+    assert [c[0] for c in bot.calls] == ["send_message"]  # a pressed button: "All watched"
+    assert bot.calls[0][1][1] == "✅ All watched"
+
+
+def test_short_batch_is_numbered_by_what_there_is(cfg, store, monkeypatch, tmp_path):
+    import downloader
+    for pid in (10, 11):
+        store.add(pid, "link", _tiktok(pid), "")
+    store.set("cursor", 12)
+    store.set("caught_up", 1)
+    captions = []
+
+    async def fake_download(p, config):
+        return str(tmp_path / "w"), downloader.DownloadResult()
+
+    async def fake_send_media(anchor, result, url, caption):
+        captions.append(caption)
+        return [SimpleNamespace(message_id=500 + len(captions))]
+
+    monkeypatch.setattr(watch, "_download", fake_download)
+    monkeypatch.setattr(watch, "_deps", SimpleNamespace(
+        failure=None, send_media=fake_send_media, slot=None))
+    bot = ChannelBot({})
+    assert asyncio.run(watch._batch(bot, cfg, SimpleNamespace(id=OWNER), quiet=True))
+    assert [c.split(" ·")[0] for c in captions] == ["1/2", "2/2"]
+    assert store.count_queued() == 0

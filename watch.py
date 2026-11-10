@@ -9,6 +9,9 @@ forwarding it silently into the owner's DM and deleting the copy at once. That
 happens a batch at a time, right when the owner presses Next (they're in the
 chat then, so nothing notifies). The owner starts the queue by sending the bot
 a link to the first unwatched post; new posts arrive as channel_post.
+
+With WATCH_DAILY_AT set, the next batch also goes out by itself every day at
+that time (WATCH_TZ); with nothing new it sends nothing.
 """
 from __future__ import annotations
 
@@ -22,7 +25,8 @@ import sqlite3
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
@@ -59,6 +63,8 @@ NOTE_LIMIT = 400
 COMMENT_WINDOW = 10 * 60
 # Posts read before the start point, for the first link's comment.
 COMMENT_LOOKBACK = 3
+# A daily batch missed while the bot was down (a restart) goes out late, up to this.
+DAILY_CATCH_UP = timedelta(hours=3)
 NEXT_BUTTON = "watch:next"
 # Shown in place of a custom emoji where custom emoji can't be rendered.
 CUSTOM_EMOJI_FALLBACK = "⭐"
@@ -182,7 +188,8 @@ CREATE TABLE IF NOT EXISTS sent (
 CREATE TABLE IF NOT EXISTS own (post_id INTEGER PRIMARY KEY);
 -- start: first post to watch; cursor: next post id to read; latest: newest
 -- post id seen; caught_up: reading reached the end (new posts come as updates);
--- control: the "Next" message in the DM.
+-- control: the "Next" message in the DM; daily_day: date.toordinal() of the
+-- last daily batch.
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER);
 """
 
@@ -302,6 +309,7 @@ _deps = SimpleNamespace(failure=None, send_media=None, slot=None)
 _fetches: dict[int, asyncio.Task] = {}
 _batch_lock = asyncio.Lock()
 _prefetch_task: asyncio.Task | None = None
+_daily_task: asyncio.Task | None = None
 
 
 def enabled(config: Config) -> bool:
@@ -327,6 +335,15 @@ def setup(bot: Bot, config: Config, *, failure, send_media, slot) -> None:
     logger.info("Watch queue on for channel %s: %d queued", config.watch_channel_id,
                 _store.count_queued())
     _kick_prefetch(config)
+    if config.watch_daily_at:
+        try:
+            at, tz = parse_daily(config.watch_daily_at), ZoneInfo(config.watch_tz)
+        except (ValueError, KeyError) as e:
+            logger.error("Watch: bad WATCH_DAILY_AT/WATCH_TZ (%s), no daily batch", e)
+            return
+        global _daily_task
+        _daily_task = asyncio.create_task(_daily(bot, config, at, tz))
+        logger.info("Watch: daily batch at %s %s", at.strftime("%H:%M"), config.watch_tz)
 
 
 def register(dp: Dispatcher) -> None:
@@ -459,11 +476,23 @@ async def _on_next(callback: CallbackQuery, bot: Bot, config: Config) -> None:
         await callback.answer()
         with contextlib.suppress(Exception):
             await callback.message.edit_reply_markup(reply_markup=None)
-        await _read(bot, config)  # this batch, if not read yet
-        await _send_batch(bot, config, callback.from_user)
-        await _read(bot, config)  # the next one, so it downloads ahead
-        await _control(bot, config)
+        await _batch(bot, config, callback.from_user)
     _kick_prefetch(config)
+
+
+async def _batch(bot: Bot, config: Config, user, quiet: bool = False) -> bool:
+    """Reads and sends the next batch (fewer if that's all there is); False if
+    there was nothing to send. With nothing to send, a pressed button gets a
+    fresh "All watched"; a quiet (daily) run sends nothing. The caller holds
+    _batch_lock."""
+    await _read(bot, config)  # this batch, if not read yet
+    if not _store.count_queued():
+        await _control(bot, config, new=not quiet)
+        return False
+    await _send_batch(bot, config, user)
+    await _read(bot, config)  # the next one, so it downloads ahead
+    await _control(bot, config)
+    return True
 
 
 async def _send_batch(bot: Bot, config: Config, user) -> None:
@@ -520,6 +549,48 @@ async def _deliver_media(bot: Bot, config: Config, p: Post, cap: str) -> list[in
         sent = await bot.send_message(config.owner_id,
                                       f"❌ {cap}\nCouldn't copy it: {html.quote(str(e))}")
         return [sent.message_id]
+
+
+# ── The daily batch ─────────────────────────────────────────────────────────
+
+def parse_daily(value: str) -> dtime:
+    """ "12:00" → time(12, 0); ValueError if it isn't HH:MM."""
+    hours, sep, minutes = value.partition(":")
+    if not sep or not hours.isdigit() or len(minutes) != 2 or not minutes.isdigit():
+        raise ValueError(f"WATCH_DAILY_AT={value!r} isn't HH:MM")
+    return dtime(int(hours), int(minutes))
+
+
+def daily_due(now: datetime, at: dtime, last_day: int | None) -> bool:
+    """Whether today's batch should go out now: its time has come, it hasn't
+    gone out today, and it's not too late to catch up."""
+    run = datetime.combine(now.date(), at, tzinfo=now.tzinfo)
+    return run <= now < run + DAILY_CATCH_UP and last_day != now.date().toordinal()
+
+
+def next_daily(now: datetime, at: dtime) -> datetime:
+    day = now.date() if now.time() < at else now.date() + timedelta(days=1)
+    return datetime.combine(day, at, tzinfo=now.tzinfo)
+
+
+async def _daily(bot: Bot, config: Config, at: dtime, tz: ZoneInfo) -> None:
+    while True:
+        now = datetime.now(tz)
+        if daily_due(now, at, _store.get("daily_day")):
+            # Marked first: a crash mid-batch mustn't send a second batch on restart.
+            _store.set("daily_day", now.date().toordinal())
+            try:
+                async with _batch_lock:
+                    owner = await bot.get_chat(config.owner_id)
+                    sent = await _batch(bot, config, owner, quiet=True)
+                logger.info("Watch: daily batch %s", "sent" if sent else "skipped, nothing new")
+            except Exception:  # noqa: BLE001
+                logger.exception("Watch: the daily batch failed")
+            _kick_prefetch(config)
+        target = next_daily(datetime.now(tz), at)
+        # Short sleeps: the wall clock may jump (NTP, DST) while asleep.
+        while (left := (target - datetime.now(tz)).total_seconds()) > 0:
+            await asyncio.sleep(min(left, 600))
 
 
 # ── Downloads ahead ─────────────────────────────────────────────────────────
