@@ -367,7 +367,8 @@ def register(dp: Dispatcher) -> None:
     dp.channel_post.register(_on_channel_post)
 
 
-def _is_watch_reply(message: Message, config: Config) -> bool:
+async def _is_watch_reply(message: Message, config: Config) -> bool:
+    # async: aiogram runs sync filters in a worker thread, and the store is loop-thread only.
     return (_in_owner_dm(message, config)
             and _store.post_of(message.reply_to_message.message_id) is not None)
 

@@ -8,6 +8,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from aiogram.dispatcher.event.handler import FilterObject
 from aiogram.types import ReactionTypeCustomEmoji, ReactionTypeEmoji, ReactionTypePaid
 
 import config as config_module
@@ -213,14 +214,20 @@ def test_reactions_elsewhere_are_ignored(cfg, store):
     assert bot.calls == []
 
 
+def _filter(callback, message, config):
+    """Runs a filter as aiogram does: a sync one goes to a worker thread, where
+    the store's SQLite connection can't be used."""
+    return asyncio.run(FilterObject(callback).call(message, config=config))
+
+
 def test_reply_goes_under_the_post(cfg, store):
     store.add(750, "link", REEL, "")
     store.mark_sent(750, [100])
     msg = SimpleNamespace(chat=SimpleNamespace(id=OWNER), from_user=SimpleNamespace(id=OWNER),
                           message_id=300, reply_to_message=SimpleNamespace(message_id=100))
-    assert watch._is_watch_reply(msg, cfg)
-    assert not watch._is_watch_reply(
-        SimpleNamespace(**{**vars(msg), "reply_to_message": SimpleNamespace(message_id=7)}), cfg)
+    assert _filter(watch._is_watch_reply, msg, cfg)
+    assert not _filter(watch._is_watch_reply, SimpleNamespace(
+        **{**vars(msg), "reply_to_message": SimpleNamespace(message_id=7)}), cfg)
     bot = FakeBot()
     asyncio.run(watch._on_reply(msg, bot, cfg))
     name, args, kwargs = bot.calls[0]
