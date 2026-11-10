@@ -202,7 +202,8 @@ CREATE TABLE IF NOT EXISTS batch (
     error TEXT,
     files TEXT
 );
--- The post's message(s) on screen in the DM; replaced by the buttons.
+-- The post's message(s) on screen in the DM, with the owner's replies to it;
+-- all deleted when a button switches the post.
 CREATE TABLE IF NOT EXISTS screen (dm_id INTEGER PRIMARY KEY);
 -- The owner's reaction mirrored under a post: one per post, whichever copy
 -- of the video it was set on.
@@ -336,6 +337,9 @@ class Store:
         self.db.execute("DELETE FROM screen")
         self.db.executemany("INSERT INTO screen VALUES (?)", [(i,) for i in dm_ids])
 
+    def add_screen(self, dm_id: int) -> None:
+        self.db.execute("INSERT OR IGNORE INTO screen VALUES (?)", (dm_id,))
+
     def add_own(self, post_id: int) -> None:
         self.db.execute("INSERT OR IGNORE INTO own VALUES (?)", (post_id,))
 
@@ -432,15 +436,22 @@ def _is_start_link(message: Message, config: Config) -> bool:
 
 
 async def _on_reply(message: Message, bot: Bot, config: Config) -> None:
-    """The owner's reply to a watch video goes to the channel under the post."""
+    """The owner's reply to a watch video goes to the channel under the post. A
+    reply to the post on screen leaves with it when a button switches the post;
+    the copy in the channel stays."""
     post_id = _store.post_of(message.reply_to_message.message_id)
+    on_screen = message.reply_to_message.message_id in _store.screen()
+    if on_screen:
+        _store.add_screen(message.message_id)
     try:
         copied = await bot.copy_message(
             config.watch_channel_id, message.chat.id, message.message_id,
             reply_parameters=ReplyParameters(message_id=post_id, allow_sending_without_reply=True))
     except Exception as e:  # noqa: BLE001
         logger.warning("Watch: couldn't post the owner's reply to post %d", post_id, exc_info=True)
-        await message.reply(f"❌ Couldn't post it to the channel: {html.quote(str(e))}")
+        error = await message.reply(f"❌ Couldn't post it to the channel: {html.quote(str(e))}")
+        if on_screen:
+            _store.add_screen(error.message_id)
         return
     _store.add_own(copied.message_id)
     logger.info("Watch: the owner's reply to post %d went to the channel", post_id)

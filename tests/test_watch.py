@@ -241,11 +241,17 @@ def test_reply_goes_under_the_post(cfg, store):
     assert not _filter(watch._is_watch_reply, SimpleNamespace(
         **{**vars(msg), "reply_to_message": SimpleNamespace(message_id=7)}), cfg)
     bot = FakeBot()
+    store.set_screen([100])  # the video replied to is on screen
     asyncio.run(watch._on_reply(msg, bot, cfg))
     name, args, kwargs = bot.calls[0]
     assert name == "copy_message" and args == (CH, OWNER, 300)
     assert kwargs["reply_parameters"].message_id == 750
     assert bot.calls[1][0] == "set_message_reaction"
+    assert store.screen() == [100, 300]  # the reply goes when the post is switched
+
+    store.set_screen([])  # a reply to a video no longer on screen stays in the chat
+    asyncio.run(watch._on_reply(SimpleNamespace(**{**vars(msg), "message_id": 301}), bot, cfg))
+    assert store.screen() == []
 
 
 def test_channel_post_is_queued_once(cfg, store):
