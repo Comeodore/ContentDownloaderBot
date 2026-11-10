@@ -16,6 +16,10 @@ class Config:
     auto_update_hours: int
     download_dir: str
     owner_id: int | None
+    # Owner-only watch queue (watch.py): the channel and the private buffer
+    # channel used to read its older posts.
+    watch_channel_id: int | None = None
+    watch_buffer_id: int | None = None
 
     @property
     def max_file_size_bytes(self) -> int:
@@ -25,6 +29,14 @@ class Config:
     def is_local_server(self) -> bool:
         """Using our own Bot API server (files are passed by path, not uploaded)."""
         return bool(self.telegram_api_base)
+
+
+def _chat_id(name: str) -> int | None:
+    value = os.getenv(name, "").strip()
+    try:
+        return int(value) if value else None
+    except ValueError:
+        raise RuntimeError(f"{name} must be a chat id like -1001234567890") from None
 
 
 def load_config() -> Config:
@@ -50,4 +62,6 @@ def load_config() -> Config:
         auto_update_hours=int(os.getenv("YTDLP_AUTO_UPDATE_HOURS", "0")),
         download_dir=os.getenv("DOWNLOAD_DIR", "./downloads").strip() or "./downloads",
         owner_id=owner_id,
+        watch_channel_id=_chat_id("WATCH_CHANNEL_ID"),
+        watch_buffer_id=_chat_id("WATCH_BUFFER_ID"),
     )

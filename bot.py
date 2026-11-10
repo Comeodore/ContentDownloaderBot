@@ -39,6 +39,7 @@ from aiogram.types import (
 
 import downloader
 import inbox
+import watch
 from config import Config, load_config
 from heartbeat import beat
 
@@ -51,6 +52,8 @@ logger = logging.getLogger("videobot")
 HEARTBEAT_FILE = "/tmp/heartbeat"
 
 dp = Dispatcher()
+# First, so the owner's replies to watch videos don't reach the link handler.
+watch.register(dp)
 
 WELCOME = (
     "👋 Hi! Send me a link and I'll send back the video or photos:\n\n"
@@ -208,7 +211,7 @@ STALE_WORK_DIR_AGE = 6 * 3600
 def _sweep_stale_work_dirs(config: Config) -> None:
     now = time.time()
     removed = 0
-    for prefix in ("vdl_", "cut_"):
+    for prefix in ("vdl_", "cut_", "watch_"):
         for path in glob.glob(os.path.join(config.download_dir, prefix + "*")):
             if not os.path.isdir(path):
                 continue
@@ -267,6 +270,18 @@ async def _job(status: Message, working_text: str):
         async with _job_slots:
             if queued:
                 await _safe_edit(status, working_text)
+            yield
+    finally:
+        _jobs_in_flight -= 1
+
+
+@contextlib.asynccontextmanager
+async def _background_slot():
+    """A request slot for downloads nobody is waiting on (the watch queue's)."""
+    global _jobs_in_flight
+    _jobs_in_flight += 1
+    try:
+        async with _job_slots:
             yield
     finally:
         _jobs_in_flight -= 1
@@ -555,15 +570,20 @@ def _caption_for(result: downloader.DownloadResult) -> str | None:
     return html.quote(_truncate_utf16(text))
 
 
-async def _send_media(message: Message, result: downloader.DownloadResult, url: str) -> None:
-    # Captions only for Threads: elsewhere descriptions are mostly hashtags.
-    caption = _caption_for(result) if downloader.is_threads(url) else None
+async def _send_media(message: Message, result: downloader.DownloadResult, url: str,
+                      caption: str | None = None) -> list[Message]:
+    """Sends the result into the message's chat; returns the messages sent."""
+    # Without a caption given, only Threads gets the post text: elsewhere
+    # descriptions are mostly hashtags.
+    if caption is None and downloader.is_threads(url):
+        caption = _caption_for(result)
     visual = [it for it in result.items if not it.is_audio]
+    sent: list[Message] = []
 
     # Albums of up to 10; the caption on the first item shows under the album.
     for chunk in _chunks(visual, 10):
         if len(chunk) == 1:
-            await _send_single(message, chunk[0], caption)
+            sent.append(await _send_single(message, chunk[0], caption))
             caption = None
             continue
         media = []
@@ -575,26 +595,27 @@ async def _send_media(message: Message, result: downloader.DownloadResult, url: 
                 else InputMediaPhoto(media=f, caption=caption)
             )
             caption = None
-        await message.answer_media_group(media=media)
+        sent.extend(await message.answer_media_group(media=media))
 
     # TikTok slideshow music: audio can't join a photo album, so it follows alone.
     for it in result.items:
         if it.is_audio:
-            await message.answer_audio(
+            sent.append(await message.answer_audio(
                 audio=FSInputFile(it.path, filename="music" + os.path.splitext(it.path)[1]),
                 caption=caption,
                 title=it.title,
                 performer=it.performer,
                 duration=it.duration,
-            )
+            ))
             caption = None
+    return sent
 
 
 async def _send_single(
     message: Message, it: downloader.MediaItem, caption: str | None = None
-) -> None:
+) -> Message:
     if it.is_video:
-        await message.answer_video(
+        return await message.answer_video(
             video=FSInputFile(it.path, filename="video.mp4"),
             caption=caption,
             duration=it.duration,
@@ -602,8 +623,7 @@ async def _send_single(
             height=it.height,
             supports_streaming=True,
         )
-    else:
-        await message.answer_photo(photo=FSInputFile(it.path), caption=caption)
+    return await message.answer_photo(photo=FSInputFile(it.path), caption=caption)
 
 
 async def _safe_edit(status: Message, text: str) -> None:
@@ -756,6 +776,7 @@ async def main() -> None:
         asyncio.create_task(_scheduled_restart(config.auto_update_hours)),
     ]
     _start_watchdog()
+    watch.setup(bot, config, failure=_failure, send_media=_send_media, slot=_background_slot)
     # Keep updates sent while the bot was down (restart, deploy).
     await bot.delete_webhook(drop_pending_updates=False)
     await _sync_profile(bot)

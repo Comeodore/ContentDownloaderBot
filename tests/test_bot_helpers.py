@@ -97,3 +97,41 @@ def test_long_captions_are_cut():
 ])
 def test_needs_cookies(url, expected):
     assert bot._needs_cookies(url) is expected
+
+
+class _FakeChat:
+    """A Message stand-in that records what's sent into its chat."""
+
+    def __init__(self):
+        self.sent = []
+
+    def __getattr__(self, name):
+        async def answer(**kwargs):
+            if name == "answer_media_group":
+                msgs = [f"{name}#{i}" for i in range(len(kwargs["media"]))]
+            else:
+                msgs = f"{name}:{kwargs.get('caption')}"
+            self.sent.append(msgs)
+            return msgs
+        return answer
+
+
+def _item(path, **kw):
+    return downloader.MediaItem(path=path, is_video=kw.pop("is_video", True), **kw)
+
+
+def test_send_media_returns_every_message_and_takes_a_caption():
+    import asyncio
+    result = downloader.DownloadResult(
+        items=[_item("a.mp4"), _item("b.jpg", is_video=False),
+               _item("m.mp3", is_video=False, is_audio=True)],
+        description="threads text")
+    chat = _FakeChat()
+    sent = asyncio.run(bot._send_media(chat, result, "https://www.instagram.com/p/x/", "1/5"))
+    assert sent == ["answer_media_group#0", "answer_media_group#1", "answer_audio:None"]
+
+    single = downloader.DownloadResult(items=[_item("a.mp4")], description="threads text")
+    assert asyncio.run(bot._send_media(_FakeChat(), single, "https://www.threads.com/@a/post/x")) \
+        == ["answer_video:threads text"]
+    assert asyncio.run(bot._send_media(_FakeChat(), single, "https://www.instagram.com/p/x/")) \
+        == ["answer_video:None"]
