@@ -311,6 +311,11 @@ class Store:
 _store: Store | None = None
 # Set by setup(): bot.py's helpers (bot.py can't be imported from here).
 _deps = SimpleNamespace(failure=None, send_media=None, slot=None)
+
+# Who the queue's downloads and failures are for in the logs, the Grafana dashboard
+# and failure reports: the channel, not the owner who reads it.
+CHANNEL = SimpleNamespace(id="watch channel", first_name="Watch queue", username=None)
+
 # Downloads per post id: a task returning (work_dir, DownloadResult).
 _fetches: dict[int, asyncio.Task] = {}
 _batch_lock = asyncio.Lock()
@@ -482,11 +487,11 @@ async def _on_next(callback: CallbackQuery, bot: Bot, config: Config) -> None:
         await callback.answer()
         with contextlib.suppress(Exception):
             await callback.message.edit_reply_markup(reply_markup=None)
-        await _batch(bot, config, callback.from_user)
+        await _batch(bot, config)
     _kick_prefetch(config)
 
 
-async def _batch(bot: Bot, config: Config, user, quiet: bool = False) -> bool:
+async def _batch(bot: Bot, config: Config, quiet: bool = False) -> bool:
     """Reads and sends the next batch (fewer if that's all there is); False if
     there was nothing to send. With nothing to send, a pressed button gets a
     fresh "All watched"; a quiet (daily) run sends nothing. The caller holds
@@ -495,13 +500,13 @@ async def _batch(bot: Bot, config: Config, user, quiet: bool = False) -> bool:
     if not _store.count_queued():
         await _control(bot, config, new=not quiet)
         return False
-    sent = await _send_batch(bot, config, user)
+    sent = await _send_batch(bot, config)
     await _read(bot, config)  # the next one, so it downloads ahead
     await _control(bot, config)
     return sent
 
 
-async def _send_batch(bot: Bot, config: Config, user) -> bool:
+async def _send_batch(bot: Bot, config: Config) -> bool:
     """Sends the next BATCH posts in order (fewer if that's all), then a fresh
     "Next" message. A post whose video can't be had (deleted, hidden, not a
     video) doesn't take a place: the next posts fill in, and the channel gets
@@ -545,9 +550,9 @@ async def _send_batch(bot: Bot, config: Config, user) -> bool:
         if p.kind == "media":
             dm_ids = await _deliver_media(bot, config, p, cap)
         elif isinstance(got, BaseException):
-            dm_ids = await _deliver_failure(bot, config, p, cap, got, user)
+            dm_ids = await _deliver_failure(bot, config, p, cap, got)
         else:
-            dm_ids = await _deliver_download(bot, config, p, cap, got[1], anchor, user)
+            dm_ids = await _deliver_download(bot, config, p, cap, got[1], anchor)
         _store.mark_sent(p.post_id, dm_ids)
     await _control(bot, config, new=bool(ready))
     return bool(ready)
@@ -563,7 +568,7 @@ async def _reply_gone(bot: Bot, config: Config, post_id: int) -> None:
 
 
 async def _deliver_download(bot: Bot, config: Config, p: Post, cap: str, result,
-                            anchor: Message, user) -> list[int]:
+                            anchor: Message) -> list[int]:
     try:
         msgs = await _deps.send_media(anchor, result, p.url, cap)
         return [m.message_id for m in msgs]
@@ -571,17 +576,17 @@ async def _deliver_download(bot: Bot, config: Config, p: Post, cap: str, result,
         failed = e
     finally:
         _release(p.post_id)
-    return await _deliver_failure(bot, config, p, cap, failed, user,
+    return await _deliver_failure(bot, config, p, cap, failed,
                                   what="Telegram didn't accept the file")
 
 
-async def _deliver_failure(bot: Bot, config: Config, p: Post, cap: str, e: BaseException, user,
+async def _deliver_failure(bot: Bot, config: Config, p: Post, cap: str, e: BaseException,
                            what: str | None = None) -> list[int]:
     """A ❌ in the batch's place; reported like any failure the owner saw."""
     _fetches.pop(p.post_id, None)
     if what is None:
         what = str(e) if isinstance(e, downloader.DownloadError) else "Unexpected error"
-    await _deps.failure(SimpleNamespace(from_user=user, bot=bot), config, p.url, what,
+    await _deps.failure(SimpleNamespace(from_user=CHANNEL, bot=bot), config, p.url, what,
                         downloader.error_detail(e), user_side=False)
     sent = await bot.send_message(
         config.owner_id, f"❌ {cap}\n{html.quote(what)}\n{html.quote(p.url)}",
@@ -631,8 +636,7 @@ async def _daily(bot: Bot, config: Config, at: dtime, tz: ZoneInfo) -> None:
             _store.set("daily_day", now.date().toordinal())
             try:
                 async with _batch_lock:
-                    owner = await bot.get_chat(config.owner_id)
-                    sent = await _batch(bot, config, owner, quiet=True)
+                    sent = await _batch(bot, config, quiet=True)
                 logger.info("Watch: daily batch %s", "sent" if sent else "skipped, nothing new")
             except Exception:  # noqa: BLE001
                 logger.exception("Watch: the daily batch failed")
@@ -666,7 +670,7 @@ async def _download(p: Post, config: Config):
     except BaseException:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise
-    logger.info("Downloaded for %s: %s — %d file(s), %.1f MB", config.owner_id, p.url,
+    logger.info("Downloaded for %s: %s — %d file(s), %.1f MB", CHANNEL.id, p.url,
                 len(result.items), result.total_size / 1024 / 1024)
     return work_dir, result
 

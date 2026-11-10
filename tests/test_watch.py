@@ -1,7 +1,10 @@
 """The owner's watch queue: post parsing, the SQLite queue and the handlers
 that mirror replies and reactions into the channel (with a fake bot)."""
 import asyncio
+import contextlib
 import dataclasses
+import logging
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -273,13 +276,13 @@ def test_batch_sends_in_order_and_maps_messages(cfg, store, monkeypatch, tmp_pat
     monkeypatch.setattr(watch, "_deps", SimpleNamespace(
         failure=fake_failure, send_media=fake_send_media, slot=None))
     bot = FakeBot()
-    assert asyncio.run(watch._send_batch(bot, cfg, SimpleNamespace(id=OWNER)))
+    assert asyncio.run(watch._send_batch(bot, cfg))
 
     # Five places: 10, ❌12, 13, 14, 15 — the deleted 11 doesn't take one.
     assert [u for u, _ in sent_media] == [REEL, _tiktok(14), _tiktok(15)]
     assert sent_media[0][1] == watch.caption(CH, 10, 1, 5, "look")
     assert sent_media[-1][1].startswith("5/5")
-    assert failures == [(OWNER, _tiktok(2), "The site refused to hand over the file.", False)]
+    assert failures == [("watch channel", _tiktok(2), "The site refused to hand over the file.", False)]
     gone_reply, failed_item, copied, control = (bot.calls[0], bot.calls[1], bot.calls[2],
                                                 bot.calls[-1])
     assert gone_reply[1] == (CH, "Пост недоступен")
@@ -292,6 +295,41 @@ def test_batch_sends_in_order_and_maps_messages(cfg, store, monkeypatch, tmp_pat
     assert store.known(901)  # the channel reply (FakeBot ids start at 901) is the bot's own
     assert 11 not in [p.post_id for p in store.queued()]
     assert set(watch._fetches) <= {16}
+
+
+# The download and failure lines as the Grafana dashboard parses them (the user regexps in
+# /opt/monitoring/grafana/dashboards/services/contentdl-bot.json). Keep them in sync.
+DASHBOARD_RE = re.compile(r"(?:for|для) (?P<user>\d+|watch channel)(?: @\w+)?: (?P<link>https?://[^ ?#]+)")
+
+
+def test_downloads_and_failures_are_logged_for_the_channel(cfg, monkeypatch, tmp_path, caplog):
+    """Not for the owner: the dashboard's Users table shows the channel as its own row."""
+    import bot as bot_module
+    import downloader
+
+    async def fake_download(url, config, work_dir):
+        return downloader.DownloadResult()
+
+    @contextlib.asynccontextmanager
+    async def slot():
+        yield
+
+    monkeypatch.setattr(downloader, "download", fake_download)
+    monkeypatch.setattr(watch, "_deps", SimpleNamespace(slot=slot, failure=bot_module._failure))
+    cfg = dataclasses.replace(cfg, download_dir=str(tmp_path), owner_id=0)
+    post = watch.Post(post_id=10, kind="link", url=REEL, note="")
+    with caplog.at_level(logging.INFO, logger="videobot"):
+        asyncio.run(watch._download(post, cfg))
+        asyncio.run(watch._deliver_failure(FakeBot(), cfg, post, "1/5",
+                                           downloader.DownloadError("boom")))
+    lines = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith(("Downloaded for", "Download failed for"))]
+    assert [line.split(":")[0] for line in lines] == [
+        "Downloaded for watch channel", "Download failed for watch channel"]
+    for line in lines:
+        m = DASHBOARD_RE.search(line)
+        assert (m["user"], m["link"]) == ("watch channel", REEL.split("?")[0])
+    assert bot_module._user_ref(watch.CHANNEL) == "Watch queue (watch channel)"
 
 
 
@@ -456,9 +494,9 @@ def test_quiet_batch_with_nothing_new_sends_nothing(cfg, store):
     bot = ChannelBot({})
     store.set("cursor", 900)
     store.set("caught_up", 1)
-    assert asyncio.run(watch._batch(bot, cfg, SimpleNamespace(id=OWNER), quiet=True)) is False
+    assert asyncio.run(watch._batch(bot, cfg, quiet=True)) is False
     assert [c[0] for c in bot.calls] == []
-    assert asyncio.run(watch._batch(bot, cfg, SimpleNamespace(id=OWNER))) is False
+    assert asyncio.run(watch._batch(bot, cfg)) is False
     assert [c[0] for c in bot.calls] == ["send_message"]  # a pressed button: "All watched"
     assert bot.calls[0][1][1] == "✅ All watched"
 
@@ -482,6 +520,6 @@ def test_short_batch_is_numbered_by_what_there_is(cfg, store, monkeypatch, tmp_p
     monkeypatch.setattr(watch, "_deps", SimpleNamespace(
         failure=None, send_media=fake_send_media, slot=None))
     bot = ChannelBot({})
-    assert asyncio.run(watch._batch(bot, cfg, SimpleNamespace(id=OWNER), quiet=True))
+    assert asyncio.run(watch._batch(bot, cfg, quiet=True))
     assert [c.split(" ·")[0] for c in captions] == ["1/2", "2/2"]
     assert store.count_queued() == 0
