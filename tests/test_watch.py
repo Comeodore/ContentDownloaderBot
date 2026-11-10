@@ -112,16 +112,16 @@ def test_queue_order_and_repeats(store):
     assert store.known(13) and not store.known(11)
 
 
-def test_sent_posts_and_reactions(store):
+def test_sent_posts_and_mirrors(store):
     store.add(10, "link", REEL, "")
     store.mark_sent(10, [100, 101])  # an album: both messages lead to the post
     assert store.count_queued() == 0
     assert store.post_of(100) == store.post_of(101) == 10
     assert store.post_of(102) is None
-    store.set_reaction(100, 555)
-    assert store.reaction_of(100) == 555
-    store.set_reaction(100, None)
-    assert store.reaction_of(100) is None
+    store.set_mirror(10, 555)
+    assert store.mirror_of(10) == 555
+    store.set_mirror(10, None)
+    assert store.mirror_of(10) is None
     assert not store.add(11, "link", REEL, "")  # already watched
 
 
@@ -166,6 +166,12 @@ class FakeBot:
     def __getattr__(self, name):
         async def call(*args, **kwargs):
             self.calls.append((name, args, kwargs))
+            if name == "send_media_group":
+                out = []
+                for _ in args[1]:
+                    self.next_id += 1
+                    out.append(SimpleNamespace(message_id=self.next_id))
+                return out
             self.next_id += 1
             return SimpleNamespace(message_id=self.next_id)
         return call
@@ -193,16 +199,22 @@ def test_reaction_is_mirrored_changed_and_removed(cfg, store):
     name, args, kwargs = bot.calls[-1]
     assert name == "send_message" and args == (CH, "❤")
     assert kwargs["reply_parameters"].message_id == 750
-    mirror = store.reaction_of(100)
+    mirror = store.mirror_of(750)
     assert mirror and store.known(mirror)  # its channel_post won't be queued
 
     asyncio.run(watch._on_reaction(_reaction("😂"), bot, cfg))
     assert bot.calls[-1][0] == "edit_message_text"
     assert bot.calls[-1][2]["message_id"] == mirror
 
-    asyncio.run(watch._on_reaction(_reaction(), bot, cfg))
+    # The same post shown again (◀️) is a new message: its reaction edits the same reply.
+    store.mark_sent(750, [200])
+    asyncio.run(watch._on_reaction(_reaction("🔥", message_id=200), bot, cfg))
+    assert bot.calls[-1][0] == "edit_message_text" and bot.calls[-1][1][0] == "🔥"
+    assert store.mirror_of(750) == mirror
+
+    asyncio.run(watch._on_reaction(_reaction(message_id=200), bot, cfg))
     assert bot.calls[-1][:2] == ("delete_message", (CH, mirror))
-    assert store.reaction_of(100) is None
+    assert store.mirror_of(750) is None
 
 
 def test_reactions_elsewhere_are_ignored(cfg, store):
@@ -251,8 +263,51 @@ def test_channel_post_is_queued_once(cfg, store):
     assert store.count_queued() == 1
 
 
-def test_batch_sends_in_order_and_maps_messages(cfg, store, monkeypatch, tmp_path):
+def _player(monkeypatch, tmp_path, *, gone=(), broken=()):
+    """Fakes for downloading and sending; returns (sent_media, failures)."""
     import downloader
+    sent_media, failures = [], []
+
+    async def fake_download(p, config):
+        if p.url in gone:
+            raise downloader.DownloadError("This video is no longer available", user_side=True)
+        if p.url in broken:
+            raise downloader.DownloadError("The site refused to hand over the file.")
+        return str(tmp_path / "w"), downloader.DownloadResult()
+
+    async def fake_send_media(anchor, result, url, caption, disable_notification=None):
+        assert anchor.chat.id == OWNER
+        sent_media.append((url, caption, disable_notification))
+        n = len(sent_media)
+        return [SimpleNamespace(message_id=500 + n, video=SimpleNamespace(file_id=f"F{n}"))]
+
+    async def fake_failure(message, config, url, error, cause=None, user_side=False):
+        failures.append((message.from_user.id, url, error, user_side))
+
+    monkeypatch.setattr(watch, "_download", fake_download)
+    monkeypatch.setattr(watch, "_deps", SimpleNamespace(
+        failure=fake_failure, send_media=fake_send_media, slot=None))
+    return sent_media, failures
+
+
+def _press(data, bot, cfg):
+    async def answer(*args, **kwargs):
+        pass
+    callback = SimpleNamespace(from_user=SimpleNamespace(id=OWNER), data=data, answer=answer)
+    asyncio.run(watch._on_button(callback, bot, cfg))
+
+
+def _text(call):
+    """The text of a send_message(chat, text) or edit_message_text(text, ...) call."""
+    return call[1][0] if call[0] == "edit_message_text" else call[1][1]
+
+
+def _buttons(call):
+    markup = call[2].get("reply_markup")
+    return [[b.text for b in row] for row in markup.inline_keyboard] if markup else []
+
+
+def test_batch_shows_one_post_at_a_time(cfg, store, monkeypatch, tmp_path):
     store.add(10, "link", REEL, "look")
     store.add(11, "link", _tiktok(1), "")   # deleted: skipped, the channel is told
     store.add(12, "link", _tiktok(2), "")   # a bot failure: ❌ in its place
@@ -261,47 +316,89 @@ def test_batch_sends_in_order_and_maps_messages(cfg, store, monkeypatch, tmp_pat
         store.add(pid, "link", _tiktok(pid), "")
     store.set("cursor", 17)
     store.set("caught_up", 1)
-    sent_media, failures = [], []
+    sent_media, failures = _player(monkeypatch, tmp_path, gone={_tiktok(1)}, broken={_tiktok(2)})
+    bot = ChannelBot({})
 
-    async def fake_download(p, config):
-        if p.url == _tiktok(1):
-            raise downloader.DownloadError("This video is no longer available", user_side=True)
-        if p.url == _tiktok(2):
-            raise downloader.DownloadError("The site refused to hand over the file.")
-        return str(tmp_path / "w"), downloader.DownloadResult()
-
-    async def fake_send_media(anchor, result, url, caption):
-        assert anchor.chat.id == OWNER
-        sent_media.append((url, caption))
-        return [SimpleNamespace(message_id=500 + len(sent_media) * 2),
-                SimpleNamespace(message_id=501 + len(sent_media) * 2)]
-
-    async def fake_failure(message, config, url, error, cause=None, user_side=False):
-        failures.append((message.from_user.id, url, error, user_side))
-
-    monkeypatch.setattr(watch, "_download", fake_download)
-    monkeypatch.setattr(watch, "_deps", SimpleNamespace(
-        failure=fake_failure, send_media=fake_send_media, slot=None))
-    bot = FakeBot()
-    assert asyncio.run(watch._send_batch(bot, cfg))
-
+    assert asyncio.run(watch._new_batch(bot, cfg))
     # Five places: 10, ❌12, 13, 14, 15 — the deleted 11 doesn't take one.
-    assert [u for u, _ in sent_media] == [REEL, _tiktok(14), _tiktok(15)]
-    assert sent_media[0][1] == watch.caption(CH, 10, 1, 5, "look")
-    assert sent_media[-1][1].startswith("5/5")
-    assert failures == [("watch channel", _tiktok(2), "The site refused to hand over the file.", False)]
-    gone_reply, failed_item, copied, control = (bot.calls[0], bot.calls[1], bot.calls[2],
-                                                bot.calls[-1])
-    assert gone_reply[1] == (CH, "Пост недоступен")
-    assert gone_reply[2]["reply_parameters"].message_id == 11
-    assert failed_item[1][1].startswith("❌ 2/5")
-    assert copied[:2] == ("copy_message", (OWNER, CH, 13))
-    assert control[0] == "send_message" and control[1][0] == OWNER
-    assert [p.post_id for p in store.queued()] == [16]
-    assert store.post_of(502) == store.post_of(503) == 10
-    assert store.known(901)  # the channel reply (FakeBot ids start at 901) is the bot's own
-    assert 11 not in [p.post_id for p in store.queued()]
-    assert set(watch._fetches) <= {16}
+    assert [b[0] for b in store.batch()] == [10, 12, 13, 14, 15]
+    assert bot.calls[0][1] == (CH, "Пост недоступен")
+    assert bot.calls[0][2]["reply_parameters"].message_id == 11
+    assert failures == [("watch channel", _tiktok(2), "The site refused to hand over the file.",
+                         False)]
+    # Only the first post is on screen, and it notifies.
+    assert sent_media == [(REEL, watch.caption(CH, 10, 1, 5, "look"), False)]
+    control = [c for c in bot.calls if c[0] == "send_message" and c[1][0] == OWNER][-1]
+    assert control[1][1] == "📺 1 of 5" and _buttons(control) == [["1/5", "▶️"]]
+    assert store.screen() == [501] and store.post_of(501) == 10
+    assert [p.post_id for p in store.queued()] == [12, 13, 14, 15, 16]  # not shown yet
+
+    bot.calls.clear()
+    old_control = store.get("control")
+    _press(watch.NEXT, bot, cfg)  # → the ❌ in place 2: the video and its buttons go
+    assert bot.calls[0][:2] == ("delete_messages", (OWNER, [501, old_control]))
+    failed = bot.calls[1]
+    assert failed[1][1].startswith("❌ 2/5") and failed[2]["disable_notification"] is True
+    assert _buttons(bot.calls[-1]) == [["◀️", "2/5", "▶️"]]
+
+    _press(watch.NEXT, bot, cfg)  # → the media post, copied from the channel
+    copied = [c for c in bot.calls if c[0] == "copy_message"][-1]
+    assert copied[1] == (OWNER, CH, 13) and copied[2]["disable_notification"] is True
+
+    for _ in range(2):
+        _press(watch.NEXT, bot, cfg)
+    assert [u for u, _, _ in sent_media] == [REEL, _tiktok(14), _tiktok(15)]
+    assert sent_media[-1][1].startswith("5/5") and sent_media[-1][2] is True
+    last = bot.calls[-1]
+    assert _text(last) == "📺 1 more to watch"
+    assert _buttons(last) == [["◀️", "5/5"], ["▶️ Next 1"]]
+
+    # Back to the first: sent again from its file id, nothing downloaded or uploaded.
+    for _ in range(4):
+        _press(watch.PREV, bot, cfg)
+    again = [c for c in bot.calls if c[0] == "send_video"][-1]
+    assert again[1] == (OWNER, "F1") and again[2]["caption"].startswith("1/5")
+    assert len(sent_media) == 3
+    assert store.post_of(store.screen()[0]) == 10
+    assert watch._fetches == {} or set(watch._fetches) <= {16}
+
+    # Next 1 → a batch of one; then nothing new.
+    for _ in range(4):
+        _press(watch.NEXT, bot, cfg)
+    _press(watch.MORE, bot, cfg)
+    assert [b[0] for b in store.batch()] == [16]
+    assert sent_media[-1][1].startswith("1/1")
+    assert _buttons(bot.calls[-1]) == [["1/1"]] and _text(bot.calls[-1]) == "✅ All watched"
+    _press(watch.MORE, bot, cfg)  # a stale Next: still all watched
+    assert [b[0] for b in store.batch()] == [16]
+
+
+def test_control_view():
+    assert watch.control_view(0, 5, 3, False) == ("📺 1 of 5", [[("1/5", watch.NOOP),
+                                                                 ("▶️", watch.NEXT)]])
+    text, rows = watch.control_view(4, 5, 7, True)
+    assert text == "📺 7+ more to watch" and rows[1] == [("▶️ Next 5", watch.MORE)]
+    assert watch.control_view(4, 5, 0, True)[0] == "📺 More to watch"
+    assert watch.control_view(None, 0, 2, False) == ("📺 2 more to watch",
+                                                     [[("▶️ Next 2", watch.MORE)]])
+    assert watch.control_view(None, 0, 0, False) == ("✅ All watched", [])
+    assert watch.control_view(1, 5, 0, False, loading=True) == ("⏳ Loading…", [])
+
+
+def test_file_ids_and_album_resend():
+    msgs = [SimpleNamespace(video=SimpleNamespace(file_id="V"), photo=None),
+            SimpleNamespace(video=None, animation=None, photo=[SimpleNamespace(file_id="small"),
+                                                              SimpleNamespace(file_id="P")]),
+            SimpleNamespace(video=None, animation=None, photo=None,
+                            audio=SimpleNamespace(file_id="A"))]
+    files = watch.file_ids(msgs)
+    assert files == [["video", "V"], ["photo", "P"], ["audio", "A"]]
+    bot = FakeBot()
+    ids = asyncio.run(watch._resend(bot, OWNER, files, "1/5", True))
+    assert [c[0] for c in bot.calls] == ["send_media_group", "send_audio"]
+    media = bot.calls[0][1][1]
+    assert [m.media for m in media] == ["V", "P"] and media[0].caption == "1/5"
+    assert bot.calls[1][2]["caption"] is None and len(ids) == 3
 
 
 # The download and failure lines as the Grafana dashboard parses them (the user regexps in
@@ -327,8 +424,7 @@ def test_downloads_and_failures_are_logged_for_the_channel(cfg, monkeypatch, tmp
     post = watch.Post(post_id=10, kind="link", url=REEL, note="")
     with caplog.at_level(logging.INFO, logger="videobot"):
         asyncio.run(watch._download(post, cfg))
-        asyncio.run(watch._deliver_failure(FakeBot(), cfg, post, "1/5",
-                                           downloader.DownloadError("boom")))
+        asyncio.run(watch._report(FakeBot(), cfg, post, downloader.DownloadError("boom")))
     lines = [r.getMessage() for r in caplog.records
              if r.getMessage().startswith(("Downloaded for", "Download failed for"))]
     assert [line.split(":")[0] for line in lines] == [
@@ -501,32 +597,21 @@ def test_quiet_batch_with_nothing_new_sends_nothing(cfg, store):
     bot = ChannelBot({})
     store.set("cursor", 900)
     store.set("caught_up", 1)
-    assert asyncio.run(watch._batch(bot, cfg, quiet=True)) is False
-    assert [c[0] for c in bot.calls] == []
-    assert asyncio.run(watch._batch(bot, cfg)) is False
-    assert [c[0] for c in bot.calls] == ["send_message"]  # a pressed button: "All watched"
-    assert bot.calls[0][1][1] == "✅ All watched"
+    assert asyncio.run(watch._new_batch(bot, cfg, quiet=True)) is False
+    assert bot.calls == []
+    store.set("control", 777)
+    assert asyncio.run(watch._new_batch(bot, cfg)) is False  # a pressed Next
+    assert bot.calls[-1][0] == "edit_message_text" and bot.calls[-1][1][0] == "✅ All watched"
 
 
 def test_short_batch_is_numbered_by_what_there_is(cfg, store, monkeypatch, tmp_path):
-    import downloader
     for pid in (10, 11):
         store.add(pid, "link", _tiktok(pid), "")
     store.set("cursor", 12)
     store.set("caught_up", 1)
-    captions = []
-
-    async def fake_download(p, config):
-        return str(tmp_path / "w"), downloader.DownloadResult()
-
-    async def fake_send_media(anchor, result, url, caption):
-        captions.append(caption)
-        return [SimpleNamespace(message_id=500 + len(captions))]
-
-    monkeypatch.setattr(watch, "_download", fake_download)
-    monkeypatch.setattr(watch, "_deps", SimpleNamespace(
-        failure=None, send_media=fake_send_media, slot=None))
+    sent_media, _ = _player(monkeypatch, tmp_path)
     bot = ChannelBot({})
-    assert asyncio.run(watch._batch(bot, cfg, quiet=True))
-    assert [c.split(" ·")[0] for c in captions] == ["1/2", "2/2"]
+    assert asyncio.run(watch._new_batch(bot, cfg, quiet=True))
+    _press(watch.NEXT, bot, cfg)
+    assert [c.split(" ·")[0] for _, c, _ in sent_media] == ["1/2", "2/2"]
     assert store.count_queued() == 0

@@ -571,8 +571,10 @@ def _caption_for(result: downloader.DownloadResult) -> str | None:
 
 
 async def _send_media(message: Message, result: downloader.DownloadResult, url: str,
-                      caption: str | None = None) -> list[Message]:
+                      caption: str | None = None,
+                      disable_notification: bool | None = None) -> list[Message]:
     """Sends the result into the message's chat; returns the messages sent."""
+    quiet = {"disable_notification": disable_notification}
     # Without a caption given, only Threads gets the post text: elsewhere
     # descriptions are mostly hashtags.
     if caption is None and downloader.is_threads(url):
@@ -583,7 +585,7 @@ async def _send_media(message: Message, result: downloader.DownloadResult, url: 
     # Albums of up to 10; the caption on the first item shows under the album.
     for chunk in _chunks(visual, 10):
         if len(chunk) == 1:
-            sent.append(await _send_single(message, chunk[0], caption))
+            sent.append(await _send_single(message, chunk[0], caption, disable_notification))
             caption = None
             continue
         media = []
@@ -595,7 +597,7 @@ async def _send_media(message: Message, result: downloader.DownloadResult, url: 
                 else InputMediaPhoto(media=f, caption=caption)
             )
             caption = None
-        sent.extend(await message.answer_media_group(media=media))
+        sent.extend(await message.answer_media_group(media=media, **quiet))
 
     # TikTok slideshow music: audio can't join a photo album, so it follows alone.
     for it in result.items:
@@ -606,13 +608,15 @@ async def _send_media(message: Message, result: downloader.DownloadResult, url: 
                 title=it.title,
                 performer=it.performer,
                 duration=it.duration,
+                **quiet,
             ))
             caption = None
     return sent
 
 
 async def _send_single(
-    message: Message, it: downloader.MediaItem, caption: str | None = None
+    message: Message, it: downloader.MediaItem, caption: str | None = None,
+    disable_notification: bool | None = None,
 ) -> Message:
     if it.is_video:
         return await message.answer_video(
@@ -622,8 +626,10 @@ async def _send_single(
             width=it.width,
             height=it.height,
             supports_streaming=True,
+            disable_notification=disable_notification,
         )
-    return await message.answer_photo(photo=FSInputFile(it.path), caption=caption)
+    return await message.answer_photo(photo=FSInputFile(it.path), caption=caption,
+                                      disable_notification=disable_notification)
 
 
 async def _safe_edit(status: Message, text: str) -> None:

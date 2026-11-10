@@ -1,8 +1,11 @@
 """Owner-only watch queue for one channel (WATCH_CHANNEL_ID).
 
-Links posted in the channel are queued, downloaded ahead and sent to the
-owner's DM a batch at a time ("Next 5"). The owner's replies to those videos,
-and reactions on them, go back to the channel as replies to the original post.
+Links posted in the channel are queued, downloaded ahead and shown in the
+owner's DM a batch (5) at a time, one post on screen: the video, and under it a
+message with ◀️ 2/5 ▶️ buttons. A button replaces both, so the current video is
+always the last one and can be reacted to or replied to without scrolling. The
+owner's replies to a video, and reactions on it, go back to the channel as
+replies to the original post.
 
 The Bot API can't read a channel's history: an older post is read by
 forwarding it silently into the owner's DM and deleting the copy at once. That
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -38,6 +42,8 @@ from aiogram.types import (
     Chat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
     LinkPreviewOptions,
     Message,
     MessageReactionUpdated,
@@ -65,7 +71,8 @@ COMMENT_WINDOW = 10 * 60
 COMMENT_LOOKBACK = 3
 # A daily batch missed while the bot was down (a restart) goes out late, up to this.
 DAILY_CATCH_UP = timedelta(hours=3)
-NEXT_BUTTON = "watch:next"
+# Buttons under the post on screen.
+PREV, NEXT, MORE, NOOP = "watch:prev", "watch:next", "watch:more", "watch:noop"
 # The bot's reply in the channel under a post whose video can't be had
 # (deleted, hidden, not a video). In the channel's language, at the owner's word.
 GONE_REPLY = "Пост недоступен"
@@ -185,14 +192,27 @@ CREATE INDEX IF NOT EXISTS posts_key ON posts(key);
 CREATE TABLE IF NOT EXISTS sent (
     dm_id INTEGER PRIMARY KEY,    -- message in the owner's DM
     post_id INTEGER NOT NULL,
-    reaction_id INTEGER           -- channel message mirroring the owner's reaction
+    reaction_id INTEGER           -- unused since mirrors moved to a table per post
 );
+-- The batch being watched, in order. error: a bot failure shown as ❌ in
+-- its place. files: JSON [[kind, file_id], ...] once sent, to show it again.
+CREATE TABLE IF NOT EXISTS batch (
+    pos INTEGER PRIMARY KEY,
+    post_id INTEGER NOT NULL,
+    error TEXT,
+    files TEXT
+);
+-- The post's message(s) on screen in the DM; replaced by the buttons.
+CREATE TABLE IF NOT EXISTS screen (dm_id INTEGER PRIMARY KEY);
+-- The owner's reaction mirrored under a post: one per post, whichever copy
+-- of the video it was set on.
+CREATE TABLE IF NOT EXISTS mirrors (post_id INTEGER PRIMARY KEY, channel_msg_id INTEGER NOT NULL);
 -- Channel messages the bot posted itself: never queued.
 CREATE TABLE IF NOT EXISTS own (post_id INTEGER PRIMARY KEY);
 -- start: first post to watch; cursor: next post id to read; latest: newest
 -- post id seen; caught_up: reading reached the end (new posts come as updates);
--- control: the "Next" message in the DM; daily_day: date.toordinal() of the
--- last daily batch.
+-- control: the buttons message in the DM; pos: the batch position on screen;
+-- daily_day: date.toordinal() of the last daily batch.
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER);
 """
 
@@ -277,12 +297,44 @@ class Store:
         row = self.db.execute("SELECT post_id FROM sent WHERE dm_id = ?", (dm_id,)).fetchone()
         return row[0] if row else None
 
-    def reaction_of(self, dm_id: int) -> int | None:
-        row = self.db.execute("SELECT reaction_id FROM sent WHERE dm_id = ?", (dm_id,)).fetchone()
+    def mirror_of(self, post_id: int) -> int | None:
+        row = self.db.execute("SELECT channel_msg_id FROM mirrors WHERE post_id = ?",
+                              (post_id,)).fetchone()
         return row[0] if row else None
 
-    def set_reaction(self, dm_id: int, channel_msg_id: int | None) -> None:
-        self.db.execute("UPDATE sent SET reaction_id = ? WHERE dm_id = ?", (channel_msg_id, dm_id))
+    def set_mirror(self, post_id: int, channel_msg_id: int | None) -> None:
+        if channel_msg_id is None:
+            self.db.execute("DELETE FROM mirrors WHERE post_id = ?", (post_id,))
+        else:
+            self.db.execute("INSERT OR REPLACE INTO mirrors VALUES (?, ?)", (post_id, channel_msg_id))
+
+    def post(self, post_id: int) -> Post:
+        return Post(*self.db.execute("SELECT post_id, kind, url, note FROM posts WHERE post_id = ?",
+                                     (post_id,)).fetchone())
+
+    def set_batch(self, items: list[tuple[int, str | None]]) -> None:
+        """The new batch: (post_id, error) in order."""
+        self.db.execute("DELETE FROM batch")
+        self.db.executemany("INSERT INTO batch (pos, post_id, error) VALUES (?, ?, ?)",
+                            [(i, pid, err) for i, (pid, err) in enumerate(items)])
+        self.set("pos", 0)
+
+    def batch(self) -> list[tuple[int, str | None, list | None]]:
+        """(post_id, error, files) in order."""
+        return [(pid, err, json.loads(files) if files else None) for pid, err, files in
+                self.db.execute("SELECT post_id, error, files FROM batch ORDER BY pos")]
+
+    def set_batch_item(self, pos: int, *, error: str | None = None,
+                       files: list | None = None) -> None:
+        self.db.execute("UPDATE batch SET error = coalesce(?, error), files = coalesce(?, files) "
+                        "WHERE pos = ?", (error, json.dumps(files) if files else None, pos))
+
+    def screen(self) -> list[int]:
+        return [r[0] for r in self.db.execute("SELECT dm_id FROM screen ORDER BY dm_id")]
+
+    def set_screen(self, dm_ids: list[int]) -> None:
+        self.db.execute("DELETE FROM screen")
+        self.db.executemany("INSERT INTO screen VALUES (?)", [(i,) for i in dm_ids])
 
     def add_own(self, post_id: int) -> None:
         self.db.execute("INSERT OR IGNORE INTO own VALUES (?)", (post_id,))
@@ -297,6 +349,7 @@ class Store:
         self.set("start", post_id)
         self.set("cursor", max(1, post_id - COMMENT_LOOKBACK))  # known ones aren't re-read
         self.set("caught_up", 0)
+        self.db.execute("DELETE FROM batch")
 
     def more_to_read(self) -> bool:
         """Whether unread posts may be ahead of the cursor."""
@@ -362,7 +415,7 @@ def register(dp: Dispatcher) -> None:
     dp.message.register(_on_reply, F.reply_to_message, _is_watch_reply)
     dp.message.register(_on_watch_command, Command("watch"), _in_owner_dm)
     dp.message.register(_on_start_link, F.text, _is_start_link)
-    dp.callback_query.register(_on_next, F.data == NEXT_BUTTON)
+    dp.callback_query.register(_on_button, F.data.startswith("watch:"))
     dp.message_reaction.register(_on_reaction)
     dp.channel_post.register(_on_channel_post)
 
@@ -398,25 +451,26 @@ async def _on_reply(message: Message, bot: Bot, config: Config) -> None:
 
 async def _on_reaction(event: MessageReactionUpdated, bot: Bot, config: Config) -> None:
     """The owner's reaction on a watch video is mirrored as a reply under the post:
-    sent, edited when changed, deleted when removed."""
+    sent, edited when changed, deleted when removed. One per post, so a video
+    shown again (◀️) updates the same reply."""
     if not enabled(config) or event.chat.id != config.owner_id or not _owner(event.user, config):
         return
     post_id = _store.post_of(event.message_id)
     if post_id is None:
         return
     text = reaction_html(event.new_reaction)
-    mirror = _store.reaction_of(event.message_id)
+    mirror = _store.mirror_of(post_id)
     channel = config.watch_channel_id
     try:
         if mirror and not text:
             await bot.delete_message(channel, mirror)
-            _store.set_reaction(event.message_id, None)
+            _store.set_mirror(post_id, None)
         elif mirror:
             await _send_or_edit(bot, channel, text, edit_id=mirror)
         elif text:
             sent = await _send_or_edit(bot, channel, text, reply_to=post_id)
             _store.add_own(sent.message_id)
-            _store.set_reaction(event.message_id, sent.message_id)
+            _store.set_mirror(post_id, sent.message_id)
         logger.info("Watch: the owner's reaction on post %d mirrored to the channel", post_id)
     except Exception:  # noqa: BLE001
         logger.warning("Watch: couldn't mirror the reaction on post %d", post_id, exc_info=True)
@@ -459,66 +513,80 @@ async def _on_channel_post(message: Message, bot: Bot, config: Config) -> None:
     # A post past the cursor leaves a gap; latest makes the next read cover it.
     if queued:
         _kick_prefetch(config)
-        await _control(bot, config)
+        await _render_control(bot, config)
 
 
 async def _on_watch_command(message: Message, bot: Bot, config: Config) -> None:
-    await _control(bot, config, new=True)
+    """Brings the post on screen (or the Next button) back to the bottom."""
+    async with _batch_lock:
+        if _store.batch():
+            await _show(bot, config, _store.get("pos") or 0)
+        else:
+            await _render_control(bot, config, new=True)
 
 
 async def _on_start_link(message: Message, bot: Bot, config: Config) -> None:
     """A link to a channel post: watch from that post on."""
     post_id = parse_post_link(message.text, config.watch_channel_id)
     async with _batch_lock:
+        await _clear_screen(bot, config)
         _store.start_from(post_id)
         logger.info("Watch: starting from post %d", post_id)
         await _read(bot, config)
-    await _control(bot, config, new=True)
+        await _render_control(bot, config, new=True)
     _kick_prefetch(config)
 
 
-async def _on_next(callback: CallbackQuery, bot: Bot, config: Config) -> None:
-    if not enabled(config) or not _owner(callback.from_user, config):
+async def _on_button(callback: CallbackQuery, bot: Bot, config: Config) -> None:
+    if not enabled(config) or not _owner(callback.from_user, config) or callback.data == NOOP:
         await callback.answer()
         return
     if _batch_lock.locked():
-        await callback.answer("Already sending")
+        await callback.answer("One moment…")
         return
     async with _batch_lock:
         await callback.answer()
-        with contextlib.suppress(Exception):
-            await callback.message.edit_reply_markup(reply_markup=None)
-        await _batch(bot, config)
+        pos, n = _store.get("pos") or 0, len(_store.batch())
+        if callback.data == PREV and pos > 0:
+            await _show(bot, config, pos - 1)
+        elif callback.data == NEXT and pos < n - 1:
+            await _show(bot, config, pos + 1)
+        elif callback.data == MORE:
+            await _new_batch(bot, config)
+        else:  # a stale button
+            await _render_control(bot, config)
     _kick_prefetch(config)
 
 
-async def _batch(bot: Bot, config: Config, quiet: bool = False) -> bool:
-    """Reads and sends the next batch (fewer if that's all there is); False if
-    there was nothing to send. With nothing to send, a pressed button gets a
-    fresh "All watched"; a quiet (daily) run sends nothing. The caller holds
-    _batch_lock."""
+async def _new_batch(bot: Bot, config: Config, quiet: bool = False) -> bool:
+    """Takes the next batch (fewer if that's all there is) and shows its first
+    post; False if there was nothing. With nothing new, a pressed button says
+    so; a quiet (daily) run does nothing. The caller holds _batch_lock."""
     await _read(bot, config)  # this batch, if not read yet
-    if not _store.count_queued():
-        await _control(bot, config, new=not quiet)
+    items = await _assemble(bot, config) if _store.count_queued() else []
+    if not items:
+        if not quiet:
+            await _render_control(bot, config)
         return False
-    sent = await _send_batch(bot, config)
-    await _read(bot, config)  # the next one, so it downloads ahead
-    await _control(bot, config)
-    return sent
+    _store.set_batch(items)
+    await _show(bot, config, 0, notify=True)
+    await _read(bot, config)  # the next batch, so it downloads ahead
+    await _render_control(bot, config)
+    return True
 
 
-async def _send_batch(bot: Bot, config: Config) -> bool:
-    """Sends the next BATCH posts in order (fewer if that's all), then a fresh
-    "Next" message. A post whose video can't be had (deleted, hidden, not a
-    video) doesn't take a place: the next posts fill in, and the channel gets
-    GONE_REPLY under it. False if nothing was sent."""
-    ready: list[tuple[Post, object]] = []  # (post, (work_dir, result) or the error)
+async def _assemble(bot: Bot, config: Config) -> list[tuple[int, str | None]]:
+    """The next BATCH posts as (post_id, error), downloads started. A post whose
+    video can't be had (deleted, hidden, not a video) doesn't take a place: the
+    next posts fill in, and the channel gets GONE_REPLY under it. A bot failure
+    keeps its place as ❌ and is reported."""
+    items: list[tuple[int, str | None]] = []
     last = 0
-    while len(ready) < BATCH:
-        posts = _store.queued(BATCH - len(ready), after=last)
+    while len(items) < BATCH:
+        posts = _store.queued(BATCH - len(items), after=last)
         if not posts:
             await _read(bot, config)
-            posts = _store.queued(BATCH - len(ready), after=last)
+            posts = _store.queued(BATCH - len(items), after=last)
             if not posts:
                 break
         for p in posts:
@@ -527,10 +595,11 @@ async def _send_batch(bot: Bot, config: Config) -> bool:
         for p in posts:
             last = p.post_id
             if p.kind != "link":
-                ready.append((p, None))
+                items.append((p.post_id, None))
                 continue
             try:
-                ready.append((p, await _fetches[p.post_id]))
+                await _fetches[p.post_id]
+                items.append((p.post_id, None))
             except downloader.DownloadError as e:
                 if e.user_side:
                     _release(p.post_id)
@@ -538,25 +607,21 @@ async def _send_batch(bot: Bot, config: Config) -> bool:
                     logger.info("Watch: post %d skipped: %s", p.post_id, e)
                     await _reply_gone(bot, config, p.post_id)
                 else:
-                    ready.append((p, e))
+                    items.append((p.post_id, await _report(bot, config, p, e)))
             except Exception as e:  # noqa: BLE001
-                ready.append((p, e))
+                items.append((p.post_id, await _report(bot, config, p, e)))
+    return items
 
-    # bot.py's sender answers a Message. The pressed one can be inaccessible
-    # (too old), so a stand-in for the owner's DM is used.
-    anchor = Message(message_id=0, date=datetime.now(timezone.utc),
-                     chat=Chat(id=config.owner_id, type="private")).as_(bot)
-    for i, (p, got) in enumerate(ready, 1):
-        cap = caption(config.watch_channel_id, p.post_id, i, len(ready), p.note)
-        if p.kind == "media":
-            dm_ids = await _deliver_media(bot, config, p, cap)
-        elif isinstance(got, BaseException):
-            dm_ids = await _deliver_failure(bot, config, p, cap, got)
-        else:
-            dm_ids = await _deliver_download(bot, config, p, cap, got[1], anchor)
-        _store.mark_sent(p.post_id, dm_ids)
-    await _control(bot, config, new=bool(ready))
-    return bool(ready)
+
+async def _report(bot: Bot, config: Config, p: Post, e: BaseException,
+                  what: str | None = None) -> str:
+    """Reports a bot failure like any other; returns the text for its ❌."""
+    _fetches.pop(p.post_id, None)
+    if what is None:
+        what = str(e) if isinstance(e, downloader.DownloadError) else "Unexpected error"
+    await _deps.failure(SimpleNamespace(from_user=CHANNEL, bot=bot), config, p.url, what,
+                        downloader.error_detail(e), user_side=False)
+    return what
 
 
 async def _reply_gone(bot: Bot, config: Config, post_id: int) -> None:
@@ -568,43 +633,186 @@ async def _reply_gone(bot: Bot, config: Config, post_id: int) -> None:
         logger.warning("Watch: couldn't reply under post %d", post_id, exc_info=True)
 
 
-async def _deliver_download(bot: Bot, config: Config, p: Post, cap: str, result,
-                            anchor: Message) -> list[int]:
-    try:
-        msgs = await _deps.send_media(anchor, result, p.url, cap)
-        return [m.message_id for m in msgs]
-    except Exception as e:  # noqa: BLE001
-        failed = e
-    finally:
-        _release(p.post_id)
-    return await _deliver_failure(bot, config, p, cap, failed,
-                                  what="Telegram didn't accept the file")
+# ── The screen: one post and the buttons ────────────────────────────────────
+
+async def _show(bot: Bot, config: Config, pos: int, notify: bool = False) -> None:
+    """Replaces the screen with the batch's post at pos and fresh buttons under it.
+    Only the batch's first post notifies; switching is silent."""
+    items = _store.batch()
+    post_id, error, files = items[pos]
+    p = _store.post(post_id)
+    cap = caption(config.watch_channel_id, post_id, pos + 1, len(items), p.note)
+    silent = not notify
+    task = _fetches.get(post_id)
+    if p.kind == "link" and not (error or files or (task and task.done())):
+        await _render_control(bot, config, loading=True)  # a download to wait for
+    result = None
+    if p.kind == "link" and not (error or files):
+        try:
+            _, result = await _fetch(p, config)
+        except Exception as e:  # noqa: BLE001
+            error = await _report(bot, config, p, e)
+            _store.set_batch_item(pos, error=error)
+
+    await _clear_screen(bot, config)
+    if error:
+        dm_ids = [(await bot.send_message(
+            config.owner_id, f"❌ {cap}\n{html.quote(error)}\n{html.quote(p.url or '')}",
+            disable_notification=silent,
+            link_preview_options=LinkPreviewOptions(is_disabled=True))).message_id]
+    elif p.kind == "media":
+        dm_ids = await _show_media(bot, config, p, cap, silent)
+    elif files:
+        dm_ids = await _resend(bot, config.owner_id, files, cap, silent)
+    else:
+        anchor = Message(message_id=0, date=datetime.now(timezone.utc),
+                         chat=Chat(id=config.owner_id, type="private")).as_(bot)
+        try:
+            msgs = await _deps.send_media(anchor, result, p.url, cap, disable_notification=silent)
+            dm_ids = [m.message_id for m in msgs]
+            _store.set_batch_item(pos, files=file_ids(msgs))
+        except Exception as e:  # noqa: BLE001
+            error = await _report(bot, config, p, e, "Telegram didn't accept the file")
+            _store.set_batch_item(pos, error=error)
+            dm_ids = [(await bot.send_message(
+                config.owner_id, f"❌ {cap}\n{html.quote(error)}\n{html.quote(p.url)}",
+                link_preview_options=LinkPreviewOptions(is_disabled=True))).message_id]
+        finally:
+            _release(post_id)
+    _store.mark_sent(post_id, dm_ids)
+    _store.set_screen(dm_ids)
+    _store.set("pos", pos)
+    await _render_control(bot, config, new=True)
 
 
-async def _deliver_failure(bot: Bot, config: Config, p: Post, cap: str, e: BaseException,
-                           what: str | None = None) -> list[int]:
-    """A ❌ in the batch's place; reported like any failure the owner saw."""
-    _fetches.pop(p.post_id, None)
-    if what is None:
-        what = str(e) if isinstance(e, downloader.DownloadError) else "Unexpected error"
-    await _deps.failure(SimpleNamespace(from_user=CHANNEL, bot=bot), config, p.url, what,
-                        downloader.error_detail(e), user_side=False)
-    sent = await bot.send_message(
-        config.owner_id, f"❌ {cap}\n{html.quote(what)}\n{html.quote(p.url)}",
-        link_preview_options=LinkPreviewOptions(is_disabled=True))
-    return [sent.message_id]
-
-
-async def _deliver_media(bot: Bot, config: Config, p: Post, cap: str) -> list[int]:
+async def _show_media(bot: Bot, config: Config, p: Post, cap: str, silent: bool) -> list[int]:
+    """A video or photo posted as is: copied from the channel."""
     try:
         copied = await bot.copy_message(config.owner_id, config.watch_channel_id, p.post_id,
-                                        caption=cap)
+                                        caption=cap, disable_notification=silent)
         return [copied.message_id]
     except Exception as e:  # noqa: BLE001
         logger.warning("Watch: couldn't copy post %d", p.post_id, exc_info=True)
         sent = await bot.send_message(config.owner_id,
-                                      f"❌ {cap}\nCouldn't copy it: {html.quote(str(e))}")
+                                      f"❌ {cap}\nCouldn't copy it: {html.quote(str(e))}",
+                                      disable_notification=silent)
         return [sent.message_id]
+
+
+def file_ids(msgs) -> list[list[str]]:
+    """[kind, file_id] of each message sent, to send it again without uploading."""
+    out = []
+    for m in msgs:
+        if getattr(m, "video", None):
+            out.append(["video", m.video.file_id])
+        elif getattr(m, "animation", None):
+            out.append(["animation", m.animation.file_id])
+        elif getattr(m, "photo", None):
+            out.append(["photo", m.photo[-1].file_id])
+        elif getattr(m, "audio", None):
+            out.append(["audio", m.audio.file_id])
+    return out
+
+
+async def _resend(bot: Bot, chat_id: int, files: list, cap: str, silent: bool) -> list[int]:
+    """Sends a post again from its file ids: one item alone, several as albums."""
+    visual = [(k, f) for k, f in files if k != "audio"]
+    ids: list[int] = []
+    if len(visual) == 1:
+        kind, file_id = visual[0]
+        send = {"video": bot.send_video, "animation": bot.send_animation,
+                "photo": bot.send_photo}[kind]
+        ids.append((await send(chat_id, file_id, caption=cap,
+                               disable_notification=silent)).message_id)
+        cap = None
+    for i in range(0, len(visual) if len(visual) > 1 else 0, 10):
+        media = []
+        for kind, file_id in visual[i:i + 10]:
+            cls = InputMediaPhoto if kind == "photo" else InputMediaVideo
+            media.append(cls(media=file_id, caption=cap))
+            cap = None
+        ids += [m.message_id for m in await bot.send_media_group(
+            chat_id, media, disable_notification=silent)]
+    for kind, file_id in files:
+        if kind == "audio":
+            ids.append((await bot.send_audio(chat_id, file_id, caption=cap,
+                                             disable_notification=silent)).message_id)
+            cap = None
+    return ids
+
+
+async def _clear_screen(bot: Bot, config: Config) -> None:
+    """Deletes the post and buttons on screen. Telegram lets a bot delete its
+    messages for 48 h; older ones just lose their buttons."""
+    ids = _store.screen() + [i for i in [_store.get("control")] if i]
+    if ids:
+        try:
+            await bot.delete_messages(config.owner_id, ids)
+        except Exception:  # noqa: BLE001
+            logger.warning("Watch: couldn't delete the screen", exc_info=True)
+            if _store.get("control"):
+                with contextlib.suppress(Exception):
+                    await bot.edit_message_reply_markup(
+                        chat_id=config.owner_id, message_id=_store.get("control"),
+                        reply_markup=None)
+    _store.set_screen([])
+    _store.set("control", None)
+
+
+def control_view(pos: int | None, n: int, left: int, more: bool, loading: bool = False):
+    """(text, keyboard rows) of the buttons message. pos None: no batch on screen.
+    left: queued posts beyond the batch; more: unread posts may follow."""
+    if loading:
+        return "⏳ Loading…", []
+    rows = []
+    if pos is not None:
+        row = []
+        if pos > 0:
+            row.append(("◀️", PREV))
+        row.append((f"{pos + 1}/{n}", NOOP))
+        if pos < n - 1:
+            row.append(("▶️", NEXT))
+        rows.append(row)
+    if pos is None or pos == n - 1:
+        if left or more:
+            rows.append([(f"▶️ Next {BATCH if more else min(left, BATCH)}", MORE)])
+            text = f"📺 {left}{'+' if more else ''} more to watch" if left else "📺 More to watch"
+        else:
+            text = "✅ All watched"
+    else:
+        text = f"📺 {pos + 1} of {n}"
+    return text, rows
+
+
+async def _render_control(bot: Bot, config: Config, new: bool = False,
+                          loading: bool = False) -> None:
+    """The buttons message: edited in place, or sent anew at the bottom."""
+    if not enabled(config):
+        return
+    items = _store.batch()
+    pos = (_store.get("pos") or 0) if items else None
+    text, rows = control_view(pos, len(items), _store.count_queued(), _store.more_to_read(),
+                              loading)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows]
+    ) if rows else None
+    old = _store.get("control")
+    try:
+        if not new:
+            if old:
+                with contextlib.suppress(TelegramBadRequest):  # not modified / deleted
+                    await bot.edit_message_text(text, chat_id=config.owner_id, message_id=old,
+                                                reply_markup=markup)
+            return
+        if old:
+            with contextlib.suppress(TelegramBadRequest):
+                await bot.edit_message_reply_markup(chat_id=config.owner_id, message_id=old,
+                                                    reply_markup=None)
+        sent = await bot.send_message(config.owner_id, text, reply_markup=markup,
+                                      disable_notification=True)
+        _store.set("control", sent.message_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("Watch: couldn't update the buttons", exc_info=True)
 
 
 # ── The daily batch ─────────────────────────────────────────────────────────
@@ -637,7 +845,7 @@ async def _daily(bot: Bot, config: Config, at: dtime, tz: ZoneInfo) -> None:
             _store.set("daily_day", now.date().toordinal())
             try:
                 async with _batch_lock:
-                    sent = await _batch(bot, config, quiet=True)
+                    sent = await _new_batch(bot, config, quiet=True)
                 logger.info("Watch: daily batch %s", "sent" if sent else "skipped, nothing new")
             except Exception:  # noqa: BLE001
                 logger.exception("Watch: the daily batch failed")
@@ -759,39 +967,3 @@ async def _read(bot: Bot, config: Config, want: int = BATCH) -> None:
         with contextlib.suppress(Exception):
             await bot.send_message(config.owner_id, f"⚠️ Couldn't read post {post_id} of the "
                                    f"channel: {html.quote(str(e))}")
-
-
-# ── The "Next" message ──────────────────────────────────────────────────────
-
-async def _control(bot: Bot, config: Config, new: bool = False) -> None:
-    """The queue size and the Next button: edited in place, or sent anew under
-    the latest batch (the old one loses its button)."""
-    if not enabled(config):
-        return
-    n = _store.count_queued()
-    more = _store.more_to_read()
-    if n or more:
-        text = f"📺 {n}+ to watch" if more and n else ("📺 More to watch" if more
-                                                       else f"📺 {n} to watch")
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-            text=f"▶️ Next {BATCH if more else min(n, BATCH)}", callback_data=NEXT_BUTTON)]])
-    else:
-        text, markup = "✅ All watched", None
-    old = _store.get("control")
-    try:
-        if not new and old:
-            with contextlib.suppress(TelegramBadRequest):  # not modified / deleted
-                await bot.edit_message_text(text, chat_id=config.owner_id, message_id=old,
-                                            reply_markup=markup)
-            return
-        if not new:
-            return
-        if old:
-            with contextlib.suppress(TelegramBadRequest):
-                await bot.edit_message_reply_markup(chat_id=config.owner_id, message_id=old,
-                                                    reply_markup=None)
-        sent = await bot.send_message(config.owner_id, text, reply_markup=markup,
-                                      disable_notification=True)
-        _store.set("control", sent.message_id)
-    except Exception:  # noqa: BLE001
-        logger.warning("Watch: couldn't update the Next message", exc_info=True)
