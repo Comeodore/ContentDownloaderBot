@@ -54,6 +54,11 @@ BATCH = 5
 END_MISSES = 30
 # Post text shown under a video; short enough for the 1024-unit caption limit.
 NOTE_LIMIT = 400
+# Text-only posts right before a link, by the same author and at most this
+# long before it, are its comment (people send "look 😂" and then the link).
+COMMENT_WINDOW = 10 * 60
+# Posts read before the start point, for the first link's comment.
+COMMENT_LOOKBACK = 3
 NEXT_BUTTON = "watch:next"
 # Shown in place of a custom emoji where custom emoji can't be rendered.
 CUSTOM_EMOJI_FALLBACK = "⭐"
@@ -106,6 +111,15 @@ def read_post(msg) -> tuple[str, str | None, str]:
     return "none", None, note
 
 
+def post_meta(msg) -> tuple[int | None, str | None]:
+    """(unix time, author signature) of a channel post, or of the original of
+    a forwarded one."""
+    origin = getattr(msg, "forward_origin", None)
+    src = origin if origin is not None else msg
+    date = getattr(src, "date", None)
+    return (int(date.timestamp()) if date else None), getattr(src, "author_signature", None)
+
+
 def dedup_key(url: str) -> str:
     """Same video, same key: Instagram /p/, /reel/, /reels/ and query strings ignored."""
     site = downloader.site_of(url) or "?"
@@ -152,8 +166,11 @@ CREATE TABLE IF NOT EXISTS posts (
     kind TEXT NOT NULL,           -- link | media | none
     url TEXT,
     key TEXT,                     -- dedup_key(url)
-    note TEXT NOT NULL DEFAULT '',
-    state TEXT NOT NULL           -- queued | sent | skipped
+    note TEXT NOT NULL DEFAULT '',  -- the post's text, with its comment for link/media
+    state TEXT NOT NULL,          -- queued | sent | skipped
+    date INTEGER,                 -- unix time
+    author TEXT,                  -- author signature
+    text TEXT NOT NULL DEFAULT '' -- the post's own text without the link
 );
 CREATE INDEX IF NOT EXISTS posts_key ON posts(key);
 CREATE TABLE IF NOT EXISTS sent (
@@ -176,6 +193,11 @@ class Store:
     def __init__(self, path: str):
         self.db = sqlite3.connect(path, isolation_level=None)
         self.db.executescript(_SCHEMA)
+        # Columns added after the first release.
+        have = {row[1] for row in self.db.execute("PRAGMA table_info(posts)")}
+        for column in ("date INTEGER", "author TEXT", "text TEXT NOT NULL DEFAULT ''"):
+            if column.split()[0] not in have:
+                self.db.execute(f"ALTER TABLE posts ADD COLUMN {column}")
 
     def get(self, key: str) -> int | None:
         row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
@@ -189,17 +211,40 @@ class Store:
             "SELECT 1 FROM posts WHERE post_id = ? UNION SELECT 1 FROM own WHERE post_id = ?",
             (post_id, post_id)).fetchone())
 
-    def add(self, post_id: int, kind: str, url: str | None, note: str) -> bool:
-        """Records a post; True if it was queued (not a repeat, not before start)."""
+    def add(self, post_id: int, kind: str, url: str | None, text: str,
+            date: int | None = None, author: str | None = None) -> bool:
+        """Records a post; True if it was queued (not a repeat, not before start).
+        A link or media post gets the comment posted right before it."""
         key = dedup_key(url) if url else None
         start = self.get("start")
         queued = (kind != "none" and (start is None or post_id >= start)
                   and not (key and self.db.execute(
                       "SELECT 1 FROM posts WHERE key = ? AND state != 'skipped'",
                       (key,)).fetchone()))
-        cur = self.db.execute("INSERT OR IGNORE INTO posts VALUES (?, ?, ?, ?, ?, ?)",
-                              (post_id, kind, url, key, note, "queued" if queued else "skipped"))
+        note = text
+        if kind != "none":
+            note = "\n".join(filter(None, (self.comment_for(post_id, date, author), text)))
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO posts (post_id, kind, url, key, note, state, date, author, text)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (post_id, kind, url, key, note, "queued" if queued else "skipped", date, author, text))
         return queued and cur.rowcount == 1
+
+    def comment_for(self, post_id: int, date: int | None, author: str | None) -> str:
+        """The text-only posts right before post_id: same author, within
+        COMMENT_WINDOW. Stops at a missing post, a link or media."""
+        parts = []
+        for prev in range(post_id - 1, max(post_id - 20, 0), -1):
+            row = self.db.execute("SELECT kind, text, date, author FROM posts WHERE post_id = ?",
+                                  (prev,)).fetchone()
+            if not row or row[0] != "none" or not row[1]:
+                break
+            if date is not None and (row[2] is None or not 0 <= date - row[2] <= COMMENT_WINDOW):
+                break
+            if author and row[3] and author != row[3]:
+                break
+            parts.append(row[1])
+        return "\n".join(reversed(parts))
 
     def queued(self, limit: int | None = None) -> list[Post]:
         rows = self.db.execute(
@@ -231,12 +276,13 @@ class Store:
 
     def start_from(self, post_id: int) -> None:
         """Everything before post_id counts as watched; from it on, posts not
-        yet sent are forgotten and read again."""
+        yet sent are forgotten and read again. Reading starts a few posts
+        earlier, for the first link's comment."""
         self.db.execute("UPDATE posts SET state = 'skipped' WHERE post_id < ? AND state = 'queued'",
                         (post_id,))
         self.db.execute("DELETE FROM posts WHERE post_id >= ? AND state != 'sent'", (post_id,))
         self.set("start", post_id)
-        self.set("cursor", post_id)
+        self.set("cursor", max(1, post_id - COMMENT_LOOKBACK))  # known ones aren't re-read
         self.set("caught_up", 0)
 
     def more_to_read(self) -> bool:
@@ -373,7 +419,7 @@ async def _on_channel_post(message: Message, bot: Bot, config: Config) -> None:
     if _store.known(post_id):
         return
     kind, url, note = read_post(message)
-    queued = _store.add(post_id, kind, url, note)
+    queued = _store.add(post_id, kind, url, note, *post_meta(message))
     logger.info("Watch: new post %d (%s)%s", post_id, kind, "" if queued else ", not queued")
     _store.set("latest", max(post_id, _store.get("latest") or 0))
     cursor = _store.get("cursor")
@@ -577,7 +623,7 @@ async def _read(bot: Bot, config: Config, want: int = BATCH) -> None:
                 await bot.delete_message(config.owner_id, fw.message_id)
             errors = misses = 0
             kind, url, note = read_post(fw)
-            _store.add(post_id, kind, url, note)
+            _store.add(post_id, kind, url, note, *post_meta(fw))
             post_id += 1
             _store.set("cursor", post_id)
     except Exception as e:  # noqa: BLE001

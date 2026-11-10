@@ -127,7 +127,8 @@ def test_start_from(store):
     store.mark_sent(12, [100])
     store.set("caught_up", 1)
     store.start_from(11)
-    assert store.get("start") == store.get("cursor") == 11
+    assert store.get("start") == 11
+    assert store.get("cursor") == 11 - watch.COMMENT_LOOKBACK  # for the first link's comment
     assert store.more_to_read()
     assert store.queued() == []  # 10 skipped; 11 and 13 forgotten, to be imported again
     assert store.known(10) and store.known(12) and not store.known(11)
@@ -337,4 +338,62 @@ def test_read_fills_a_gap_after_catching_up(cfg, store):
     store.add(803, "link", _tiktok(3), "")
     asyncio.run(watch._read(bot, cfg))
     assert [p.post_id for p in store.queued()] == [800, 802, 803]
-    assert [c[1][2] for c in bot.calls if c[0] == "forward_message"] == [800, 801, 802]
+    assert [c[1][2] for c in bot.calls if c[0] == "forward_message"] == [797, 798, 799, 800,
+                                                                        801, 802]
+
+
+# ── A comment posted right before the link ──────────────────────────────────
+
+T = 1700000000
+AUTHOR = "Author One"
+
+
+def test_comment_before_the_link_goes_with_it(store):
+    store.add(759, "link", _tiktok(1), "", T - 100, AUTHOR)
+    store.add(760, "none", None, "Я", T, AUTHOR)
+    store.add(761, "none", None, "смотри", T + 30, AUTHOR)
+    assert store.add(762, "link", REEL, "", T + 60, AUTHOR)
+    assert store.queued()[-1].note == "Я\nсмотри"
+
+
+def test_comment_and_own_text_both_go(store):
+    store.add(760, "none", None, "Я", T, AUTHOR)
+    store.add(761, "link", REEL, "this one", T + 5, AUTHOR)
+    assert store.queued()[0].note == "Я\nthis one"
+
+
+@pytest.mark.parametrize("prev", [
+    (760, "none", None, "old", T - watch.COMMENT_WINDOW - 1, AUTHOR),  # too long before
+    (760, "none", None, "Я", T, "Someone Else"),  # another author
+    (759, "none", None, "Я", T, AUTHOR),  # not right before: 760 is unknown
+    (760, "link", _tiktok(1), "", T, AUTHOR),  # a link isn't a comment
+])
+def test_not_a_comment(store, prev):
+    store.add(*prev)
+    store.add(761, "link", REEL, "", T + 5, AUTHOR)
+    assert store.queued()[-1].note == ""
+
+
+def test_post_meta_reads_the_forwarded_original():
+    from datetime import datetime, timezone
+    d = datetime.fromtimestamp(T, timezone.utc)
+    fw = SimpleNamespace(forward_origin=SimpleNamespace(date=d, author_signature=AUTHOR),
+                         date=datetime.now(timezone.utc), author_signature=None)
+    assert watch.post_meta(fw) == (T, AUTHOR)
+    post = SimpleNamespace(date=d, author_signature=None)
+    assert watch.post_meta(post) == (T, None)
+
+
+def test_old_database_gets_the_new_columns(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE posts (post_id INTEGER PRIMARY KEY, kind TEXT NOT NULL, url TEXT,"
+               " key TEXT, note TEXT NOT NULL DEFAULT '', state TEXT NOT NULL)")
+    db.execute("INSERT INTO posts VALUES (5, 'link', 'u', 'k', '', 'sent')")
+    db.commit()
+    db.close()
+    store = watch.Store(path)
+    assert store.add(760, "none", None, "Я", T, AUTHOR) is False
+    assert store.add(761, "link", REEL, "", T + 5, AUTHOR)
+    assert store.queued()[0].note == "Я"

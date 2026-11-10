@@ -48,7 +48,7 @@ Offline: no network, Telegram or real downloads.
 For one channel (`WATCH_CHANNEL_ID`, the bot is an admin there) where links to videos are posted:
 
 - The owner sends the bot a link to the first unwatched post (`t.me/c/…/750`). Older posts can't be read through the Bot API, so the bot forwards each one silently into the owner's DM and deletes the copy at once, a batch at a time when Next is pressed. New posts arrive by themselves.
-- **▶️ Next 5** sends the next five videos to the owner's DM, each captioned with a link to its post. The next batch is downloaded ahead. The same video posted twice comes once. `/watch` brings the button back.
+- **▶️ Next 5** sends the next five videos to the owner's DM, each captioned with a link to its post and the post's text. Text-only posts right before a link (same author, within 10 minutes) count as its comment and go into the caption too. The next batch is downloaded ahead. The same video posted twice comes once. `/watch` brings the button back.
 - A reply to one of those videos (text, voice, sticker…) is copied into the channel as a reply to the original post. A reaction on it is posted there the same way, edited when changed, deleted when removed.
 
 State: `watch.db` next to the downloads dir (`watch.py`).
