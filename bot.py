@@ -695,7 +695,7 @@ def _start_watchdog() -> None:
 
     Docker doesn't restart unhealthy containers, only exited ones.
     """
-    def watch() -> None:
+    def check() -> None:
         while True:
             time.sleep(30)
             stalled = time.monotonic() - _loop_tick["t"]
@@ -703,7 +703,7 @@ def _start_watchdog() -> None:
                 logger.critical("Event loop stalled for %.0f s, restarting the process", stalled)
                 os._exit(1)
 
-    threading.Thread(target=watch, name="watchdog", daemon=True).start()
+    threading.Thread(target=check, name="watchdog", daemon=True).start()
 
 
 async def _sync_profile(bot: Bot) -> None:

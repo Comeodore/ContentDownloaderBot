@@ -4,10 +4,11 @@ Links posted in the channel are queued, downloaded ahead and sent to the
 owner's DM a batch at a time ("Next 5"). The owner's replies to those videos,
 and reactions on them, go back to the channel as replies to the original post.
 
-The Bot API can't read a channel's history, so older posts are read by
-forwarding them one by one into WATCH_BUFFER_ID (a private channel where the
-bot is an admin) and deleting the copies. The owner starts the queue by sending
-the bot a link to the first unwatched post; new posts arrive as channel_post.
+The Bot API can't read a channel's history: an older post is read by
+forwarding it silently into the owner's DM and deleting the copy at once. That
+happens a batch at a time, right when the owner presses Next (they're in the
+chat then, so nothing notifies). The owner starts the queue by sending the bot
+a link to the first unwatched post; new posts arrive as channel_post.
 """
 from __future__ import annotations
 
@@ -47,10 +48,10 @@ from config import Config
 logger = logging.getLogger("videobot.watch")
 
 BATCH = 5
-# The history import stops after this many ids in a row that can't be
-# forwarded: past the newest post every id fails, and gaps (deleted posts,
-# service messages) are much shorter.
-IMPORT_END_MISSES = 30
+# Reading stops after this many ids in a row that can't be forwarded: past the
+# newest post every id fails, and gaps (deleted posts, service messages) are
+# much shorter.
+END_MISSES = 30
 # Post text shown under a video; short enough for the 1024-unit caption limit.
 NOTE_LIMIT = 400
 NEXT_BUTTON = "watch:next"
@@ -162,8 +163,9 @@ CREATE TABLE IF NOT EXISTS sent (
 );
 -- Channel messages the bot posted itself: never queued.
 CREATE TABLE IF NOT EXISTS own (post_id INTEGER PRIMARY KEY);
--- start: first post to watch; cursor: next post id to import;
--- latest: newest post id seen; control: the "Next" message in the DM.
+-- start: first post to watch; cursor: next post id to read; latest: newest
+-- post id seen; caught_up: reading reached the end (new posts come as updates);
+-- control: the "Next" message in the DM.
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER);
 """
 
@@ -229,12 +231,20 @@ class Store:
 
     def start_from(self, post_id: int) -> None:
         """Everything before post_id counts as watched; from it on, posts not
-        yet sent are forgotten and imported again."""
+        yet sent are forgotten and read again."""
         self.db.execute("UPDATE posts SET state = 'skipped' WHERE post_id < ? AND state = 'queued'",
                         (post_id,))
         self.db.execute("DELETE FROM posts WHERE post_id >= ? AND state != 'sent'", (post_id,))
         self.set("start", post_id)
         self.set("cursor", post_id)
+        self.set("caught_up", 0)
+
+    def more_to_read(self) -> bool:
+        """Whether unread posts may be ahead of the cursor."""
+        cursor = self.get("cursor")
+        if cursor is None:
+            return False
+        return not self.get("caught_up") or (self.get("latest") or 0) >= cursor
 
 
 # ── Telegram side ───────────────────────────────────────────────────────────
@@ -245,7 +255,6 @@ _deps = SimpleNamespace(failure=None, send_media=None, slot=None)
 # Downloads per post id: a task returning (work_dir, DownloadResult).
 _fetches: dict[int, asyncio.Task] = {}
 _batch_lock = asyncio.Lock()
-_import_task: asyncio.Task | None = None
 _prefetch_task: asyncio.Task | None = None
 
 
@@ -262,7 +271,7 @@ def _in_owner_dm(message: Message, config: Config) -> bool:
 
 
 def setup(bot: Bot, config: Config, *, failure, send_media, slot) -> None:
-    """Opens the queue and resumes the import and prefetch; no-op unless configured."""
+    """Opens the queue and resumes downloading ahead; no-op unless configured."""
     global _store
     if not (config.owner_id and config.watch_channel_id):
         return
@@ -271,8 +280,6 @@ def setup(bot: Bot, config: Config, *, failure, send_media, slot) -> None:
     _deps.failure, _deps.send_media, _deps.slot = failure, send_media, slot
     logger.info("Watch queue on for channel %s: %d queued", config.watch_channel_id,
                 _store.count_queued())
-    if _store.get("cursor") is not None and config.watch_buffer_id:
-        _start_import(bot, config)
     _kick_prefetch(config)
 
 
@@ -370,10 +377,11 @@ async def _on_channel_post(message: Message, bot: Bot, config: Config) -> None:
     logger.info("Watch: new post %d (%s)%s", post_id, kind, "" if queued else ", not queued")
     _store.set("latest", max(post_id, _store.get("latest") or 0))
     cursor = _store.get("cursor")
-    if cursor is None or (post_id == cursor and not _importing()):
+    if cursor is None:  # no start point: only new posts are watched
+        _store.set("caught_up", 1)
+    if cursor is None or post_id == cursor:
         _store.set("cursor", post_id + 1)
-    elif post_id > cursor and config.watch_buffer_id:
-        _start_import(bot, config)  # the posts in between
+    # A post past the cursor leaves a gap; latest makes the next read cover it.
     if queued:
         _kick_prefetch(config)
         await _control(bot, config)
@@ -386,17 +394,12 @@ async def _on_watch_command(message: Message, bot: Bot, config: Config) -> None:
 async def _on_start_link(message: Message, bot: Bot, config: Config) -> None:
     """A link to a channel post: watch from that post on."""
     post_id = parse_post_link(message.text, config.watch_channel_id)
-    if not config.watch_buffer_id:
-        await message.answer("Reading older posts needs WATCH_BUFFER_ID in the bot's .env.")
-        return
-    if _importing():
-        _import_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await _import_task
-    _store.start_from(post_id)
-    logger.info("Watch: starting from post %d", post_id)
-    _start_import(bot, config)
+    async with _batch_lock:
+        _store.start_from(post_id)
+        logger.info("Watch: starting from post %d", post_id)
+        await _read(bot, config)
     await _control(bot, config, new=True)
+    _kick_prefetch(config)
 
 
 async def _on_next(callback: CallbackQuery, bot: Bot, config: Config) -> None:
@@ -410,7 +413,10 @@ async def _on_next(callback: CallbackQuery, bot: Bot, config: Config) -> None:
         await callback.answer()
         with contextlib.suppress(Exception):
             await callback.message.edit_reply_markup(reply_markup=None)
+        await _read(bot, config)  # this batch, if not read yet
         await _send_batch(bot, config, callback.from_user)
+        await _read(bot, config)  # the next one, so it downloads ahead
+        await _control(bot, config)
     _kick_prefetch(config)
 
 
@@ -525,39 +531,32 @@ async def _prefetch(config: Config) -> None:
             await _fetch(todo[0], config)
 
 
-# ── History import ──────────────────────────────────────────────────────────
+# ── Reading the channel ─────────────────────────────────────────────────────
 
-def _importing() -> bool:
-    return _import_task is not None and not _import_task.done()
+async def _read(bot: Bot, config: Config, want: int = BATCH) -> None:
+    """Reads posts from the cursor on until `want` are queued or the channel ends.
 
-
-def _start_import(bot: Bot, config: Config) -> None:
-    global _import_task
-    if not _importing():
-        _import_task = asyncio.create_task(_import(bot, config))
-
-
-async def _import(bot: Bot, config: Config) -> None:
-    """Reads posts from the cursor on by forwarding them into the buffer channel."""
-    channel, buffer = config.watch_channel_id, config.watch_buffer_id
-    copies: list[int] = []
+    Each post is forwarded silently into the owner's DM, read and deleted at
+    once: the Bot API has no other way to see an older post.
+    """
     post_id = _store.get("cursor")
-    misses = errors = found = 0
-    last_refresh = time.monotonic()
-    logger.info("Watch: importing from post %d", post_id)
+    misses = errors = 0
     try:
-        # A wrong buffer would make every forward fail like a missing post.
-        member = await bot.get_chat_member(buffer, (await bot.me()).id)
-        if member.status not in ("administrator", "creator"):
-            raise RuntimeError(f"the bot is {member.status} in the buffer channel, not an admin")
-        while misses < IMPORT_END_MISSES or post_id <= (_store.get("latest") or 0):
+        while post_id is not None and _store.count_queued() < want:
+            if post_id > (_store.get("latest") or 0) and (
+                    _store.get("caught_up") or misses >= END_MISSES):
+                if not _store.get("caught_up"):
+                    _store.set("caught_up", 1)
+                    logger.info("Watch: read the channel up to post %d", _store.get("cursor") - 1)
+                return
             if _store.known(post_id):
                 post_id += 1
                 misses = 0
-                _store.set("cursor", max(post_id, _store.get("cursor") or 0))
+                _store.set("cursor", max(post_id, _store.get("cursor")))
                 continue
             try:
-                fw = await bot.forward_message(buffer, channel, post_id, disable_notification=True)
+                fw = await bot.forward_message(config.owner_id, config.watch_channel_id, post_id,
+                                               disable_notification=True)
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after + 1)
                 continue
@@ -570,64 +569,40 @@ async def _import(bot: Bot, config: Config) -> None:
                 continue
             except Exception:  # noqa: BLE001
                 errors += 1
-                if errors > 5:
+                if errors > 3:
                     raise
-                await asyncio.sleep(5 * errors)
+                await asyncio.sleep(2 * errors)
                 continue
+            with contextlib.suppress(Exception):
+                await bot.delete_message(config.owner_id, fw.message_id)
             errors = misses = 0
-            copies.append(fw.message_id)
             kind, url, note = read_post(fw)
-            if _store.add(post_id, kind, url, note):
-                found += 1
-                _kick_prefetch(config)
+            _store.add(post_id, kind, url, note)
             post_id += 1
             _store.set("cursor", post_id)
-            if len(copies) >= 100:
-                await _delete_copies(bot, buffer, copies)
-            if time.monotonic() - last_refresh > 15:
-                last_refresh = time.monotonic()
-                await _control(bot, config)
-        logger.info("Watch: import done at post %d, %d queued", _store.get("cursor"), found)
-    except asyncio.CancelledError:
-        raise
     except Exception as e:  # noqa: BLE001
-        logger.exception("Watch: import stopped at post %d", post_id)
+        logger.exception("Watch: reading stopped at post %s", post_id)
         with contextlib.suppress(Exception):
-            await bot.send_message(config.owner_id, "⚠️ Stopped reading the channel at post "
-                                   f"{post_id}: {html.quote(str(e))}")
-    finally:
-        await _delete_copies(bot, buffer, copies)
-        await _control(bot, config, reading=False)
-
-
-async def _delete_copies(bot: Bot, buffer: int, copies: list[int]) -> None:
-    while copies:
-        chunk, copies[:] = copies[:100], copies[100:]
-        with contextlib.suppress(Exception):
-            await bot.delete_messages(buffer, chunk)
+            await bot.send_message(config.owner_id, f"⚠️ Couldn't read post {post_id} of the "
+                                   f"channel: {html.quote(str(e))}")
 
 
 # ── The "Next" message ──────────────────────────────────────────────────────
 
-async def _control(bot: Bot, config: Config, new: bool = False,
-                   reading: bool | None = None) -> None:
+async def _control(bot: Bot, config: Config, new: bool = False) -> None:
     """The queue size and the Next button: edited in place, or sent anew under
     the latest batch (the old one loses its button)."""
     if not enabled(config):
         return
-    if reading is None:
-        reading = _importing()
     n = _store.count_queued()
-    if n:
-        text = f"📺 {n} to watch"
-    elif reading:
-        text = "📥 Reading the channel…"
+    more = _store.more_to_read()
+    if n or more:
+        text = f"📺 {n}+ to watch" if more and n else ("📺 More to watch" if more
+                                                       else f"📺 {n} to watch")
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text=f"▶️ Next {BATCH if more else min(n, BATCH)}", callback_data=NEXT_BUTTON)]])
     else:
-        text = "✅ All watched"
-    if n and reading:
-        text += " · still reading the channel…"
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-        text=f"▶️ Next {min(n, BATCH)}", callback_data=NEXT_BUTTON)]]) if n else None
+        text, markup = "✅ All watched", None
     old = _store.get("control")
     try:
         if not new and old:

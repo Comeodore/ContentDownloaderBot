@@ -16,10 +16,8 @@ class Config:
     auto_update_hours: int
     download_dir: str
     owner_id: int | None
-    # Owner-only watch queue (watch.py): the channel and the private buffer
-    # channel used to read its older posts.
+    # Owner-only watch queue (watch.py): the channel whose videos it serves.
     watch_channel_id: int | None = None
-    watch_buffer_id: int | None = None
 
     @property
     def max_file_size_bytes(self) -> int:
@@ -63,5 +61,4 @@ def load_config() -> Config:
         download_dir=os.getenv("DOWNLOAD_DIR", "./downloads").strip() or "./downloads",
         owner_id=owner_id,
         watch_channel_id=_chat_id("WATCH_CHANNEL_ID"),
-        watch_buffer_id=_chat_id("WATCH_BUFFER_ID"),
     )

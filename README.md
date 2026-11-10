@@ -42,13 +42,12 @@ Offline: no network, Telegram or real downloads.
 | `TELEGRAM_API_BASE` | local Bot API server URL, for files up to 2 GB |
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | from my.telegram.org, local server only |
 | `WATCH_CHANNEL_ID` | channel for the owner's watch queue (below); empty = off |
-| `WATCH_BUFFER_ID` | private channel where the bot reads that channel's older posts |
 
 ## Watch queue (owner only)
 
 For one channel (`WATCH_CHANNEL_ID`, the bot is an admin there) where links to videos are posted:
 
-- The owner sends the bot a link to the first unwatched post (`t.me/c/…/750`). Older posts can't be read through the Bot API, so the bot forwards them one by one into `WATCH_BUFFER_ID` (a private channel, the bot an admin) and deletes the copies. New posts arrive by themselves.
+- The owner sends the bot a link to the first unwatched post (`t.me/c/…/750`). Older posts can't be read through the Bot API, so the bot forwards each one silently into the owner's DM and deletes the copy at once, a batch at a time when Next is pressed. New posts arrive by themselves.
 - **▶️ Next 5** sends the next five videos to the owner's DM, each captioned with a link to its post. The next batch is downloaded ahead. The same video posted twice comes once. `/watch` brings the button back.
 - A reply to one of those videos (text, voice, sticker…) is copied into the channel as a reply to the original post. A reaction on it is posted there the same way, edited when changed, deleted when removed.
 

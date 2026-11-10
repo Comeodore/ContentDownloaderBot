@@ -125,8 +125,10 @@ def test_start_from(store):
     for pid in (10, 11, 12, 13):
         store.add(pid, "link", f"https://www.tiktok.com/@a/video/{pid}", "")
     store.mark_sent(12, [100])
+    store.set("caught_up", 1)
     store.start_from(11)
     assert store.get("start") == store.get("cursor") == 11
+    assert store.more_to_read()
     assert store.queued() == []  # 10 skipped; 11 and 13 forgotten, to be imported again
     assert store.known(10) and store.known(12) and not store.known(11)
     assert not store.add(9, "link", "https://www.tiktok.com/@a/video/9", "")  # before start
@@ -141,10 +143,10 @@ def test_own_posts_are_known(store):
 def test_config_reads_watch_ids(monkeypatch):
     monkeypatch.setenv("BOT_TOKEN", "0:test")
     monkeypatch.setenv("WATCH_CHANNEL_ID", str(CH))
-    monkeypatch.setenv("WATCH_BUFFER_ID", "")
-    cfg = config_module.load_config()
-    assert cfg.watch_channel_id == CH and cfg.watch_buffer_id is None
-    monkeypatch.setenv("WATCH_BUFFER_ID", "nope")
+    assert config_module.load_config().watch_channel_id == CH
+    monkeypatch.setenv("WATCH_CHANNEL_ID", "")
+    assert config_module.load_config().watch_channel_id is None
+    monkeypatch.setenv("WATCH_CHANNEL_ID", "nope")
     with pytest.raises(RuntimeError):
         config_module.load_config()
 
@@ -231,6 +233,7 @@ def test_channel_post_is_queued_once(cfg, store):
     asyncio.run(watch._on_channel_post(post, bot, cfg))
     assert [p.post_id for p in store.queued()] == [760]
     assert store.get("cursor") == 761 and store.get("latest") == 760
+    assert not store.more_to_read()  # no start point: only new posts, nothing to read
     store.add_own(761)
     asyncio.run(watch._on_channel_post(
         SimpleNamespace(**{**vars(post), "message_id": 761}), bot, cfg))
@@ -274,3 +277,64 @@ def test_batch_sends_in_order_and_maps_messages(cfg, store, monkeypatch, tmp_pat
     assert store.post_of(500) == store.post_of(501) == 10
     assert store.get("control") == bot.next_id
     assert watch._fetches == {}
+
+
+class ChannelBot(FakeBot):
+    """Forwards the given channel posts into the DM; other ids are missing."""
+
+    def __init__(self, posts):
+        super().__init__()
+        self.posts = posts
+
+    async def forward_message(self, chat_id, from_chat_id, message_id, **kwargs):
+        from aiogram.exceptions import TelegramBadRequest
+        self.calls.append(("forward_message", (chat_id, from_chat_id, message_id), kwargs))
+        if message_id not in self.posts:
+            raise TelegramBadRequest(method=None,
+                                     message="Bad Request: message to forward not found")
+        self.next_id += 1
+        return SimpleNamespace(message_id=self.next_id, text=self.posts[message_id],
+                               caption=None, entities=None, caption_entities=None)
+
+
+def _tiktok(n):
+    return f"https://www.tiktok.com/@a/video/{n}"
+
+
+def test_read_goes_a_batch_at_a_time_and_cleans_up(cfg, store):
+    posts = {750: REEL, 751: "hi", 753: _tiktok(1), 754: _tiktok(2), 755: _tiktok(3),
+             756: _tiktok(4), 757: _tiktok(5), 758: _tiktok(6)}
+    bot = ChannelBot(posts)
+    store.start_from(750)
+
+    asyncio.run(watch._read(bot, cfg))
+    assert [p.post_id for p in store.queued()] == [750, 753, 754, 755, 756]
+    assert store.get("cursor") == 757 and store.more_to_read()
+    forwards = [c for c in bot.calls if c[0] == "forward_message"]
+    assert all(c[1][0] == OWNER and c[2]["disable_notification"] for c in forwards)
+    # Every copy in the DM is deleted right away.
+    assert len([c for c in bot.calls if c[0] == "delete_message"]) == len(posts) - 2
+
+    for p in store.queued():
+        store.mark_sent(p.post_id, [])
+    asyncio.run(watch._read(bot, cfg))
+    assert [p.post_id for p in store.queued()] == [757, 758]
+    assert store.get("caught_up") == 1 and store.get("cursor") == 759
+    assert not store.more_to_read()
+    tried = [c[1][2] for c in bot.calls if c[0] == "forward_message"]
+    assert tried[-1] == 758 + watch.END_MISSES  # probed past the end, then stopped
+
+    calls = len(bot.calls)
+    asyncio.run(watch._read(bot, cfg))  # caught up: no probing again
+    assert len(bot.calls) == calls
+
+
+def test_read_fills_a_gap_after_catching_up(cfg, store):
+    bot = ChannelBot({800: _tiktok(1), 802: _tiktok(2)})
+    store.start_from(800)
+    store.set("caught_up", 1)
+    store.set("latest", 803)  # post 803 came as an update; 800-802 weren't read
+    store.add(803, "link", _tiktok(3), "")
+    asyncio.run(watch._read(bot, cfg))
+    assert [p.post_id for p in store.queued()] == [800, 802, 803]
+    assert [c[1][2] for c in bot.calls if c[0] == "forward_message"] == [800, 801, 802]
