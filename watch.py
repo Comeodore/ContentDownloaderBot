@@ -66,6 +66,9 @@ COMMENT_LOOKBACK = 3
 # A daily batch missed while the bot was down (a restart) goes out late, up to this.
 DAILY_CATCH_UP = timedelta(hours=3)
 NEXT_BUTTON = "watch:next"
+# The bot's reply in the channel under a post whose video can't be had
+# (deleted, hidden, not a video). In the channel's language, at the owner's word.
+GONE_REPLY = "Пост недоступен"
 # Shown in place of a custom emoji where custom emoji can't be rendered.
 CUSTOM_EMOJI_FALLBACK = "⭐"
 
@@ -173,7 +176,7 @@ CREATE TABLE IF NOT EXISTS posts (
     url TEXT,
     key TEXT,                     -- dedup_key(url)
     note TEXT NOT NULL DEFAULT '',  -- the post's text, with its comment for link/media
-    state TEXT NOT NULL,          -- queued | sent | skipped
+    state TEXT NOT NULL,          -- queued | sent | skipped | gone (deleted video)
     date INTEGER,                 -- unix time
     author TEXT,                  -- author signature
     text TEXT NOT NULL DEFAULT '' -- the post's own text without the link
@@ -253,11 +256,14 @@ class Store:
             parts.append(row[1])
         return "\n".join(reversed(parts))
 
-    def queued(self, limit: int | None = None) -> list[Post]:
+    def queued(self, limit: int | None = None, after: int = 0) -> list[Post]:
         rows = self.db.execute(
-            "SELECT post_id, kind, url, note FROM posts WHERE state = 'queued' "
-            "ORDER BY post_id LIMIT ?", (-1 if limit is None else limit,)).fetchall()
+            "SELECT post_id, kind, url, note FROM posts WHERE state = 'queued' AND post_id > ? "
+            "ORDER BY post_id LIMIT ?", (after, -1 if limit is None else limit)).fetchall()
         return [Post(*r) for r in rows]
+
+    def mark_gone(self, post_id: int) -> None:
+        self.db.execute("UPDATE posts SET state = 'gone' WHERE post_id = ?", (post_id,))
 
     def count_queued(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM posts WHERE state = 'queued'").fetchone()[0]
@@ -489,52 +495,96 @@ async def _batch(bot: Bot, config: Config, user, quiet: bool = False) -> bool:
     if not _store.count_queued():
         await _control(bot, config, new=not quiet)
         return False
-    await _send_batch(bot, config, user)
+    sent = await _send_batch(bot, config, user)
     await _read(bot, config)  # the next one, so it downloads ahead
     await _control(bot, config)
-    return True
+    return sent
 
 
-async def _send_batch(bot: Bot, config: Config, user) -> None:
-    """Sends the next BATCH posts in order, then a fresh "Next" message."""
+async def _send_batch(bot: Bot, config: Config, user) -> bool:
+    """Sends the next BATCH posts in order (fewer if that's all), then a fresh
+    "Next" message. A post whose video can't be had (deleted, hidden, not a
+    video) doesn't take a place: the next posts fill in, and the channel gets
+    GONE_REPLY under it. False if nothing was sent."""
+    ready: list[tuple[Post, object]] = []  # (post, (work_dir, result) or the error)
+    last = 0
+    while len(ready) < BATCH:
+        posts = _store.queued(BATCH - len(ready), after=last)
+        if not posts:
+            await _read(bot, config)
+            posts = _store.queued(BATCH - len(ready), after=last)
+            if not posts:
+                break
+        for p in posts:
+            if p.kind == "link":
+                _fetch(p, config)  # all at once; the job slots limit the parallelism
+        for p in posts:
+            last = p.post_id
+            if p.kind != "link":
+                ready.append((p, None))
+                continue
+            try:
+                ready.append((p, await _fetches[p.post_id]))
+            except downloader.DownloadError as e:
+                if e.user_side:
+                    _release(p.post_id)
+                    _store.mark_gone(p.post_id)
+                    logger.info("Watch: post %d skipped: %s", p.post_id, e)
+                    await _reply_gone(bot, config, p.post_id)
+                else:
+                    ready.append((p, e))
+            except Exception as e:  # noqa: BLE001
+                ready.append((p, e))
+
     # bot.py's sender answers a Message. The pressed one can be inaccessible
     # (too old), so a stand-in for the owner's DM is used.
     anchor = Message(message_id=0, date=datetime.now(timezone.utc),
                      chat=Chat(id=config.owner_id, type="private")).as_(bot)
-    posts = _store.queued(BATCH)
-    for p in posts:
-        if p.kind == "link":
-            _fetch(p, config)  # all at once; the job slots limit the parallelism
-    for i, p in enumerate(posts, 1):
-        cap = caption(config.watch_channel_id, p.post_id, i, len(posts), p.note)
-        dm_ids = await (_deliver_media(bot, config, p, cap) if p.kind == "media"
-                        else _deliver_link(bot, config, p, cap, anchor, user))
+    for i, (p, got) in enumerate(ready, 1):
+        cap = caption(config.watch_channel_id, p.post_id, i, len(ready), p.note)
+        if p.kind == "media":
+            dm_ids = await _deliver_media(bot, config, p, cap)
+        elif isinstance(got, BaseException):
+            dm_ids = await _deliver_failure(bot, config, p, cap, got, user)
+        else:
+            dm_ids = await _deliver_download(bot, config, p, cap, got[1], anchor, user)
         _store.mark_sent(p.post_id, dm_ids)
-    await _control(bot, config, new=True)
+    await _control(bot, config, new=bool(ready))
+    return bool(ready)
 
 
-async def _deliver_link(bot: Bot, config: Config, p: Post, cap: str, anchor: Message,
-                        user) -> list[int]:
+async def _reply_gone(bot: Bot, config: Config, post_id: int) -> None:
     try:
-        _, result = await (_fetches.get(p.post_id) or _fetch(p, config))
-    except downloader.DownloadError as e:
-        failed, detail, user_side = str(e), downloader.error_detail(e), e.user_side
+        sent = await bot.send_message(config.watch_channel_id, GONE_REPLY,
+                                      reply_parameters=ReplyParameters(message_id=post_id))
+        _store.add_own(sent.message_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("Watch: couldn't reply under post %d", post_id, exc_info=True)
+
+
+async def _deliver_download(bot: Bot, config: Config, p: Post, cap: str, result,
+                            anchor: Message, user) -> list[int]:
+    try:
+        msgs = await _deps.send_media(anchor, result, p.url, cap)
+        return [m.message_id for m in msgs]
     except Exception as e:  # noqa: BLE001
-        failed, detail, user_side = "Unexpected error", downloader.error_detail(e), False
-    else:
-        try:
-            msgs = await _deps.send_media(anchor, result, p.url, cap)
-            return [m.message_id for m in msgs]
-        except Exception as e:  # noqa: BLE001
-            failed, detail, user_side = ("Telegram didn't accept the file",
-                                         downloader.error_detail(e), False)
-        finally:
-            _release(p.post_id)
+        failed = e
+    finally:
+        _release(p.post_id)
+    return await _deliver_failure(bot, config, p, cap, failed, user,
+                                  what="Telegram didn't accept the file")
+
+
+async def _deliver_failure(bot: Bot, config: Config, p: Post, cap: str, e: BaseException, user,
+                           what: str | None = None) -> list[int]:
+    """A ❌ in the batch's place; reported like any failure the owner saw."""
     _fetches.pop(p.post_id, None)
-    await _deps.failure(SimpleNamespace(from_user=user, bot=bot), config, p.url, failed,
-                        detail, user_side=user_side)
+    if what is None:
+        what = str(e) if isinstance(e, downloader.DownloadError) else "Unexpected error"
+    await _deps.failure(SimpleNamespace(from_user=user, bot=bot), config, p.url, what,
+                        downloader.error_detail(e), user_side=False)
     sent = await bot.send_message(
-        config.owner_id, f"❌ {cap}\n{html.quote(failed)}\n{html.quote(p.url)}",
+        config.owner_id, f"❌ {cap}\n{html.quote(what)}\n{html.quote(p.url)}",
         link_preview_options=LinkPreviewOptions(is_disabled=True))
     return [sent.message_id]
 
@@ -596,9 +646,11 @@ async def _daily(bot: Bot, config: Config, at: dtime, tz: ZoneInfo) -> None:
 # ── Downloads ahead ─────────────────────────────────────────────────────────
 
 def _fetch(p: Post, config: Config) -> asyncio.Task:
-    """The post's download, started if absent or failed before (a retry)."""
+    """The post's download, started if absent or failed before (a retry,
+    unless the video is gone: that's final)."""
     task = _fetches.get(p.post_id)
-    if task is None or (task.done() and (task.cancelled() or task.exception())):
+    if task is None or (task.done() and (task.cancelled() or (
+            task.exception() and not getattr(task.exception(), "user_side", False)))):
         task = asyncio.create_task(_download(p, config))
         task.add_done_callback(lambda t: t.cancelled() or t.exception())  # mark retrieved
         _fetches[p.post_id] = task

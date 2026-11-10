@@ -244,19 +244,27 @@ def test_channel_post_is_queued_once(cfg, store):
 def test_batch_sends_in_order_and_maps_messages(cfg, store, monkeypatch, tmp_path):
     import downloader
     store.add(10, "link", REEL, "look")
-    store.add(11, "link", "https://www.tiktok.com/@a/video/1", "")
-    store.add(12, "media", None, "")
+    store.add(11, "link", _tiktok(1), "")   # deleted: skipped, the channel is told
+    store.add(12, "link", _tiktok(2), "")   # a bot failure: ❌ in its place
+    store.add(13, "media", None, "")
+    for pid in (14, 15, 16):
+        store.add(pid, "link", _tiktok(pid), "")
+    store.set("cursor", 17)
+    store.set("caught_up", 1)
     sent_media, failures = [], []
 
     async def fake_download(p, config):
-        if "tiktok" in p.url:
+        if p.url == _tiktok(1):
             raise downloader.DownloadError("This video is no longer available", user_side=True)
+        if p.url == _tiktok(2):
+            raise downloader.DownloadError("The site refused to hand over the file.")
         return str(tmp_path / "w"), downloader.DownloadResult()
 
     async def fake_send_media(anchor, result, url, caption):
         assert anchor.chat.id == OWNER
         sent_media.append((url, caption))
-        return [SimpleNamespace(message_id=500), SimpleNamespace(message_id=501)]
+        return [SimpleNamespace(message_id=500 + len(sent_media) * 2),
+                SimpleNamespace(message_id=501 + len(sent_media) * 2)]
 
     async def fake_failure(message, config, url, error, cause=None, user_side=False):
         failures.append((message.from_user.id, url, error, user_side))
@@ -265,19 +273,26 @@ def test_batch_sends_in_order_and_maps_messages(cfg, store, monkeypatch, tmp_pat
     monkeypatch.setattr(watch, "_deps", SimpleNamespace(
         failure=fake_failure, send_media=fake_send_media, slot=None))
     bot = FakeBot()
-    asyncio.run(watch._send_batch(bot, cfg, SimpleNamespace(id=OWNER)))
+    assert asyncio.run(watch._send_batch(bot, cfg, SimpleNamespace(id=OWNER)))
 
-    assert sent_media == [(REEL, watch.caption(CH, 10, 1, 3, "look"))]
-    assert failures == [(OWNER, "https://www.tiktok.com/@a/video/1",
-                         "This video is no longer available", True)]
-    names = [c[0] for c in bot.calls]
-    assert names == ["send_message", "copy_message", "send_message"]  # ❌ item, media, Next
-    assert bot.calls[0][1][1].startswith("❌ 2/3")
-    assert bot.calls[1][1] == (OWNER, CH, 12)
-    assert store.count_queued() == 0
-    assert store.post_of(500) == store.post_of(501) == 10
-    assert store.get("control") == bot.next_id
-    assert watch._fetches == {}
+    # Five places: 10, ❌12, 13, 14, 15 — the deleted 11 doesn't take one.
+    assert [u for u, _ in sent_media] == [REEL, _tiktok(14), _tiktok(15)]
+    assert sent_media[0][1] == watch.caption(CH, 10, 1, 5, "look")
+    assert sent_media[-1][1].startswith("5/5")
+    assert failures == [(OWNER, _tiktok(2), "The site refused to hand over the file.", False)]
+    gone_reply, failed_item, copied, control = (bot.calls[0], bot.calls[1], bot.calls[2],
+                                                bot.calls[-1])
+    assert gone_reply[1] == (CH, "Пост недоступен")
+    assert gone_reply[2]["reply_parameters"].message_id == 11
+    assert failed_item[1][1].startswith("❌ 2/5")
+    assert copied[:2] == ("copy_message", (OWNER, CH, 13))
+    assert control[0] == "send_message" and control[1][0] == OWNER
+    assert [p.post_id for p in store.queued()] == [16]
+    assert store.post_of(502) == store.post_of(503) == 10
+    assert store.known(901)  # the channel reply (FakeBot ids start at 901) is the bot's own
+    assert 11 not in [p.post_id for p in store.queued()]
+    assert set(watch._fetches) <= {16}
+
 
 
 class ChannelBot(FakeBot):

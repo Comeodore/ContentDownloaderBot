@@ -14,6 +14,12 @@ deleted or hidden one answers 400 "Media not found or unavailable" (verified
 2026-11-05); falling back would end in "You need to log in" and a false cookie
 alarm, so it gets its own "story is gone" error.
 
+Gone posts: under the session a deleted reel, or one from a private account,
+answers media/<pk>/info/ with 400 "Media not found or unavailable" (verified
+2026-11-10; guests get "empty media response"). yt-dlp reports a bare
+"HTTP Error 400", which the bot took for the site refusing. It's raised as
+"no longer available" instead: the user's side, not a bot failure.
+
 Dead session: the API redirects to /accounts/login/ with a 200 HTML page
 (verified 2026-11-06), which yt-dlp misreads as "Failed to parse JSON". We raise
 "session expired" instead; no guest fallback, since the bot only uses the
@@ -31,6 +37,7 @@ import subprocess
 from urllib.parse import urlsplit
 
 from yt_dlp.extractor.instagram import InstagramIE, InstagramStoryIE
+from yt_dlp.networking.exceptions import HTTPError
 from yt_dlp.utils import ExtractorError, determine_ext, int_or_none, traverse_obj, url_or_none
 
 from yt_dlp_plugins.extractor._images import best_image
@@ -106,6 +113,23 @@ def _refuse_login_redirect(ie, url_or_request, urlh, logged_in):
     return urlh
 
 
+def _refuse_gone_media(url_or_request, error):
+    """Raises "no longer available" for the media API's 400 "not found or unavailable"."""
+    url = str(getattr(url_or_request, 'url', url_or_request))
+    cause = error.cause
+    if not (isinstance(cause, HTTPError) and cause.status == 400 and '/api/v1/media/' in url):
+        return
+    try:
+        body = cause.response.read(4096)
+    except Exception:  # noqa: BLE001
+        return
+    if b'not found or unavailable' in body.lower():
+        # No "login"/"private" in the text, or the bot reads it as a cookie problem.
+        raise ExtractorError(
+            'Instagram post is no longer available: deleted, or its account is hidden',
+            expected=True) from error
+
+
 def _with_photo_format(info, product_media):
     """Give media without video a photo format."""
     if info.get('formats'):
@@ -135,9 +159,12 @@ class _InstagramIE(InstagramIE, plugin_name='videobot'):
     def _request_webpage(self, url_or_request, *args, **kwargs):
         # Read before the request: Set-Cookie on the way to login may drop sessionid.
         logged_in = self._is_logged_in
-        return _refuse_login_redirect(
-            self, url_or_request, super()._request_webpage(url_or_request, *args, **kwargs),
-            logged_in)
+        try:
+            urlh = super()._request_webpage(url_or_request, *args, **kwargs)
+        except ExtractorError as e:
+            _refuse_gone_media(url_or_request, e)
+            raise
+        return _refuse_login_redirect(self, url_or_request, urlh, logged_in)
 
 
 class _InstagramStoryIE(InstagramStoryIE, plugin_name='videobot'):

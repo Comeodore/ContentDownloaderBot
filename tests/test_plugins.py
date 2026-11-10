@@ -263,3 +263,35 @@ def test_plugins_are_allowed(name):
 
 def test_generic_is_not_allowed():
     assert not any(re.fullmatch(p, "generic", re.IGNORECASE) for p in downloader._ALLOWED_EXTRACTORS)
+
+
+# ── A deleted or hidden reel under the session ──────────────────────────────
+
+def _api_error(status, body, url=API):
+    import io
+    from yt_dlp.networking import Response
+    from yt_dlp.networking.exceptions import HTTPError
+    err = HTTPError(Response(io.BytesIO(body), url, {}, status=status))
+    return ExtractorError(f"Video info extraction failed: {err}", cause=err)
+
+
+def test_gone_reel_is_no_longer_available():
+    gone = _api_error(400, b'{"message":"Media not found or unavailable","status":"fail"}')
+    with pytest.raises(ExtractorError, match="no longer available") as e:
+        ig._refuse_gone_media(API, gone)
+    err = downloader._as_download_error(
+        yt_dlp.utils.DownloadError(f"ERROR: [Instagram+videobot] x: {e.value.orig_msg}"),
+        "instagram")
+    assert err.user_side and not err.auth
+    assert str(err) == "This video is no longer available — deleted or private."
+
+
+@pytest.mark.parametrize("error, url", [
+    (_api_error(400, b'{"message":"checkpoint_required"}'), API),  # another 400
+    (_api_error(500, b"Media not found or unavailable"), API),       # not a 400
+    (_api_error(400, b"Media not found or unavailable"),
+     "https://www.instagram.com/graphql/query/"),                     # not the media API
+    (ExtractorError("Unable to download webpage: timed out"), API),  # no HTTP response
+])
+def test_other_api_errors_pass_through(error, url):
+    ig._refuse_gone_media(url, error)  # doesn't raise
