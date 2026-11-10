@@ -621,3 +621,37 @@ def test_short_batch_is_numbered_by_what_there_is(cfg, store, monkeypatch, tmp_p
     _press(watch.NEXT, bot, cfg)
     assert [c.split(" ·")[0] for _, c, _ in sent_media] == ["1/2", "2/2"]
     assert store.count_queued() == 0
+
+
+# ── 🗑 Remove my replies ─────────────────────────────────────────────────────
+
+def test_control_offers_to_remove_replies():
+    text, rows = watch.control_view(1, 5, 3, False, answers=2)
+    assert rows == [[("◀️", watch.PREV), ("2/5", watch.NOOP), ("▶️", watch.NEXT)],
+                    [("🗑 Remove my replies (2)", watch.UNDO)]]
+    _, rows = watch.control_view(4, 5, 1, False, answers=1)
+    assert rows[1:] == [[("🗑 Remove my replies (1)", watch.UNDO)], [("▶️ Next 1", watch.MORE)]]
+
+
+def test_remove_my_replies(cfg, store):
+    store.add(750, "link", REEL, "")
+    store.set_batch([(750, None)])
+    store.mark_sent(750, [100])
+    store.set_screen([100])
+    store.set("control", 101)
+    bot = FakeBot()
+    reply = SimpleNamespace(chat=SimpleNamespace(id=OWNER), from_user=SimpleNamespace(id=OWNER),
+                            message_id=300, reply_to_message=SimpleNamespace(message_id=100))
+    asyncio.run(watch._on_reply(reply, bot, cfg))
+    copy_id = bot.next_id - 2  # copy_message, then the 👌, then the control edit
+    asyncio.run(watch._on_reaction(_reaction("❤"), bot, cfg))
+    mirror = store.mirror_of(750)
+    assert store.answers_count(750) == 2
+    assert _buttons(bot.calls[-1])[-1] == ["🗑 Remove my replies (2)"]
+
+    bot.calls.clear()
+    _press(watch.UNDO, bot, cfg)
+    assert bot.calls[0][:2] == ("delete_messages", (CH, [copy_id, mirror]))
+    assert bot.calls[1][:2] == ("delete_messages", (OWNER, [300]))
+    assert store.answers_count(750) == 0 and store.screen() == [100]
+    assert _buttons(bot.calls[-1]) == [["1/1"]]  # the button is gone

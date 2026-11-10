@@ -73,6 +73,8 @@ COMMENT_LOOKBACK = 3
 DAILY_CATCH_UP = timedelta(hours=3)
 # Buttons under the post on screen.
 PREV, NEXT, MORE, NOOP = "watch:prev", "watch:next", "watch:more", "watch:noop"
+# Removes the owner's reaction reply and comment copies under the post on screen.
+UNDO = "watch:undo"
 # The bot's reply in the channel under a post whose video can't be had
 # (deleted, hidden, not a video). In the channel's language, at the owner's word.
 GONE_REPLY = "Пост недоступен"
@@ -208,6 +210,13 @@ CREATE TABLE IF NOT EXISTS screen (dm_id INTEGER PRIMARY KEY);
 -- The owner's reaction mirrored under a post: one per post, whichever copy
 -- of the video it was set on.
 CREATE TABLE IF NOT EXISTS mirrors (post_id INTEGER PRIMARY KEY, channel_msg_id INTEGER NOT NULL);
+-- The owner's comments copied into the channel: the copy, its post and the
+-- original in the DM.
+CREATE TABLE IF NOT EXISTS replies (
+    channel_msg_id INTEGER PRIMARY KEY,
+    post_id INTEGER NOT NULL,
+    dm_id INTEGER NOT NULL
+);
 -- Channel messages the bot posted itself: never queued.
 CREATE TABLE IF NOT EXISTS own (post_id INTEGER PRIMARY KEY);
 -- start: first post to watch; cursor: next post id to read; latest: newest
@@ -340,6 +349,23 @@ class Store:
     def add_screen(self, dm_id: int) -> None:
         self.db.execute("INSERT OR IGNORE INTO screen VALUES (?)", (dm_id,))
 
+    def add_reply(self, channel_msg_id: int, post_id: int, dm_id: int) -> None:
+        self.db.execute("INSERT OR REPLACE INTO replies VALUES (?, ?, ?)",
+                        (channel_msg_id, post_id, dm_id))
+
+    def replies_of(self, post_id: int) -> list[tuple[int, int]]:
+        """(channel copy, DM original) of the owner's comments on the post."""
+        return self.db.execute("SELECT channel_msg_id, dm_id FROM replies WHERE post_id = ? "
+                               "ORDER BY channel_msg_id", (post_id,)).fetchall()
+
+    def answers_count(self, post_id: int) -> int:
+        """The owner's replies under the post in the channel: comments and the reaction."""
+        return len(self.replies_of(post_id)) + (1 if self.mirror_of(post_id) else 0)
+
+    def forget_answers(self, post_id: int) -> None:
+        self.db.execute("DELETE FROM replies WHERE post_id = ?", (post_id,))
+        self.set_mirror(post_id, None)
+
     def add_own(self, post_id: int) -> None:
         self.db.execute("INSERT OR IGNORE INTO own VALUES (?)", (post_id,))
 
@@ -454,10 +480,13 @@ async def _on_reply(message: Message, bot: Bot, config: Config) -> None:
             _store.add_screen(error.message_id)
         return
     _store.add_own(copied.message_id)
+    _store.add_reply(copied.message_id, post_id, message.message_id)
     logger.info("Watch: the owner's reply to post %d went to the channel", post_id)
     with contextlib.suppress(Exception):
         await bot.set_message_reaction(message.chat.id, message.message_id,
                                        [ReactionTypeEmoji(emoji="👌")])
+    if on_screen:
+        await _render_control(bot, config)  # the 🗑 button
 
 
 async def _on_reaction(event: MessageReactionUpdated, bot: Bot, config: Config) -> None:
@@ -485,6 +514,8 @@ async def _on_reaction(event: MessageReactionUpdated, bot: Bot, config: Config) 
         logger.info("Watch: the owner's reaction on post %d mirrored to the channel", post_id)
     except Exception:  # noqa: BLE001
         logger.warning("Watch: couldn't mirror the reaction on post %d", post_id, exc_info=True)
+    if event.message_id in _store.screen():
+        await _render_control(bot, config)  # the 🗑 button
 
 
 async def _send_or_edit(bot: Bot, chat_id: int, text: str, *, reply_to: int | None = None,
@@ -564,9 +595,30 @@ async def _on_button(callback: CallbackQuery, bot: Bot, config: Config) -> None:
             await _show(bot, config, pos + 1)
         elif callback.data == MORE:
             await _new_batch(bot, config)
+        elif callback.data == UNDO and n:
+            await _undo(bot, config, _store.batch()[pos][0])
         else:  # a stale button
             await _render_control(bot, config)
     _kick_prefetch(config)
+
+
+async def _undo(bot: Bot, config: Config, post_id: int) -> None:
+    """Deletes the owner's reaction reply and comment copies under the post, and the
+    comments in the DM. The reaction on the video stays: a bot can't remove it, but
+    changing it posts a new reply."""
+    copies = _store.replies_of(post_id)
+    channel_ids = [c for c, _ in copies] + [m for m in [_store.mirror_of(post_id)] if m]
+    with contextlib.suppress(Exception):
+        await bot.delete_messages(config.watch_channel_id, channel_ids)
+    dm_ids = [d for _, d in copies]
+    if dm_ids:
+        with contextlib.suppress(Exception):
+            await bot.delete_messages(config.owner_id, dm_ids)
+    _store.set_screen([i for i in _store.screen() if i not in dm_ids])
+    _store.forget_answers(post_id)
+    logger.info("Watch: the owner's replies under post %d removed (%d)", post_id,
+                len(channel_ids))
+    await _render_control(bot, config)
 
 
 async def _new_batch(bot: Bot, config: Config, quiet: bool = False) -> bool:
@@ -770,9 +822,11 @@ async def _clear_screen(bot: Bot, config: Config) -> None:
     _store.set("control", None)
 
 
-def control_view(pos: int | None, n: int, left: int, more: bool, loading: bool = False):
+def control_view(pos: int | None, n: int, left: int, more: bool, loading: bool = False,
+                 answers: int = 0):
     """(text, keyboard rows) of the buttons message. pos None: no batch on screen.
-    left: queued posts beyond the batch; more: unread posts may follow."""
+    left: queued posts beyond the batch; more: unread posts may follow; answers:
+    the owner's replies under the post on screen."""
     if loading:
         return "⏳ Loading…", []
     rows = []
@@ -784,6 +838,8 @@ def control_view(pos: int | None, n: int, left: int, more: bool, loading: bool =
         if pos < n - 1:
             row.append(("▶️", NEXT))
         rows.append(row)
+    if pos is not None and answers:
+        rows.append([(f"🗑 Remove my replies ({answers})", UNDO)])
     if pos is None or pos == n - 1:
         if left or more:
             rows.append([(f"▶️ Next {BATCH if more else min(left, BATCH)}", MORE)])
@@ -802,8 +858,9 @@ async def _render_control(bot: Bot, config: Config, new: bool = False,
         return
     items = _store.batch()
     pos = (_store.get("pos") or 0) if items else None
+    answers = _store.answers_count(items[pos][0]) if items and pos < len(items) else 0
     text, rows = control_view(pos, len(items), _store.count_queued(), _store.more_to_read(),
-                              loading)
+                              loading, answers)
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows]
     ) if rows else None
