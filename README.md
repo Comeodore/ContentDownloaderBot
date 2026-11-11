@@ -9,6 +9,8 @@ Telegram bot: send a link, get the video or photos back.
 
 Timecodes after a link (`<link> 1:00-1:10, 2:10-2:55`) cut clips.
 
+When Telegram fails an upload on its own side (`Internal Server Error`), the status tells the user the upload will take a bit longer, and the bot sends again after 3, 10 and 30 s.
+
 Stack: [aiogram 3](https://aiogram.dev/), [yt-dlp](https://github.com/yt-dlp/yt-dlp), ffmpeg. TikTok comes without a watermark by default: yt-dlp takes the stream before the watermark is applied.
 
 ## Running locally

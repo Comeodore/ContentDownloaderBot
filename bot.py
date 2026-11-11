@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import glob
 import logging
 import os
@@ -24,7 +25,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -306,6 +307,51 @@ def _user_text(e: downloader.DownloadError) -> str:
     return str(e) if e.user_side else _STANDARD_ERROR
 
 
+# Telegram sometimes fails an upload on its own side ("Bad Request: internal
+# Server Error during file upload", 2026-11-11); the same file went through 8 s
+# later. Such a send is retried after these pauses, in seconds.
+UPLOAD_RETRY_DELAYS = (3, 10, 30)
+_TELEGRAM_SLOW = "Telegram is having issues — the upload will take a bit longer"
+_TELEGRAM_DOWN = ("Telegram isn't accepting the file — the problem is on Telegram's side. "
+                  "Try again in a few minutes.")
+
+
+def _is_telegram_glitch(e: BaseException) -> bool:
+    """A send Telegram failed on its own side, worth repeating."""
+    return isinstance(e, TelegramAPIError) and "internal server error" in str(e).lower()
+
+
+async def _upload(send, on_glitch=None):
+    """Awaits send(), calling it again after Telegram's own failures.
+
+    send makes a new request each call; it's repeated alone, so the messages
+    already sent for a post aren't sent twice. on_glitch() runs before each retry.
+    """
+    for delay in (*UPLOAD_RETRY_DELAYS, None):
+        try:
+            return await send()
+        except TelegramAPIError as e:
+            if delay is None or not _is_telegram_glitch(e):
+                raise
+            logger.warning("Telegram failed the upload on its side, retrying in %d s: %s",
+                           delay, e)
+            if on_glitch:
+                await on_glitch()
+            await asyncio.sleep(delay)
+
+
+def _slow_upload_notice(status: Message):
+    """An on_glitch for _upload that tells the user once, in the status."""
+    shown = False
+
+    async def notice() -> None:
+        nonlocal shown
+        if not shown:
+            shown = True
+            await _safe_edit(status, f"{_TELEGRAM_SLOW} {_spinner()}")
+    return notice
+
+
 def _log_failure(message: Message, url: str, error: str, cause: str | None = None,
                  exc_info: bool = False) -> None:
     """One line per failure the user saw; the Grafana dashboard parses it.
@@ -449,12 +495,13 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
                         len(result.items), result.total_size / 1024 / 1024)
 
             try:
-                await _send_media(message, result, url)
+                await _send_media(message, result, url, on_glitch=_slow_upload_notice(status))
                 await status.delete()
             except Exception as e:  # noqa: BLE001
                 await _failure(message, config, url, "Telegram didn't accept the file",
                                downloader.error_detail(e), exc_info=True)
-                await status.edit_text("❌ " + _STANDARD_ERROR)
+                await status.edit_text(
+                    "❌ " + (_TELEGRAM_DOWN if _is_telegram_glitch(e) else _STANDARD_ERROR))
                 return
             done = time.monotonic()
             _log_delivery(message, url, queue=slot - started,
@@ -503,6 +550,7 @@ async def _handle_cut(
 
             vdur = result.duration
             sent = 0
+            on_glitch = _slow_upload_notice(status)
             for i, (start, end) in enumerate(ranges):  # sent in order
                 label = f"{_fmt_ts(start)}–{_fmt_ts(end)}"
                 if vdur and start >= vdur:
@@ -520,21 +568,23 @@ async def _handle_cut(
                     await message.answer(f"❌ {label}: {html.quote(text)}")
                     continue
                 try:
-                    await message.answer_video(
+                    await _upload(functools.partial(
+                        message.answer_video,
                         video=FSInputFile(clip.path, filename="clip.mp4"),
                         caption=label,
                         duration=clip.duration,
                         width=clip.width,
                         height=clip.height,
                         supports_streaming=True,
-                    )
+                    ), on_glitch)
                     sent += 1
                 except Exception as e:  # noqa: BLE001
                     await _failure(message, config, url,
                                    f"{label}: Telegram didn't accept this clip",
                                    downloader.error_detail(e), exc_info=True)
-                    await message.answer(
-                        f"❌ {label}: Telegram didn't accept this clip. {_NOTIFIED}")
+                    reason = (_TELEGRAM_DOWN if _is_telegram_glitch(e)
+                              else f"Telegram didn't accept this clip. {_NOTIFIED}")
+                    await message.answer(f"❌ {label}: {reason}")
 
             if sent:
                 await status.delete()
@@ -572,8 +622,11 @@ def _caption_for(result: downloader.DownloadResult) -> str | None:
 
 async def _send_media(message: Message, result: downloader.DownloadResult, url: str,
                       caption: str | None = None,
-                      disable_notification: bool | None = None) -> list[Message]:
-    """Sends the result into the message's chat; returns the messages sent."""
+                      disable_notification: bool | None = None,
+                      on_glitch=None) -> list[Message]:
+    """Sends the result into the message's chat; returns the messages sent.
+
+    Each send is retried after Telegram's own failures (see _upload)."""
     quiet = {"disable_notification": disable_notification}
     # Without a caption given, only Threads gets the post text: elsewhere
     # descriptions are mostly hashtags.
@@ -585,7 +638,8 @@ async def _send_media(message: Message, result: downloader.DownloadResult, url: 
     # Albums of up to 10; the caption on the first item shows under the album.
     for chunk in _chunks(visual, 10):
         if len(chunk) == 1:
-            sent.append(await _send_single(message, chunk[0], caption, disable_notification))
+            sent.append(await _upload(functools.partial(
+                _send_single, message, chunk[0], caption, disable_notification), on_glitch))
             caption = None
             continue
         media = []
@@ -597,19 +651,21 @@ async def _send_media(message: Message, result: downloader.DownloadResult, url: 
                 else InputMediaPhoto(media=f, caption=caption)
             )
             caption = None
-        sent.extend(await message.answer_media_group(media=media, **quiet))
+        sent.extend(await _upload(functools.partial(
+            message.answer_media_group, media=media, **quiet), on_glitch))
 
     # TikTok slideshow music: audio can't join a photo album, so it follows alone.
     for it in result.items:
         if it.is_audio:
-            sent.append(await message.answer_audio(
+            sent.append(await _upload(functools.partial(
+                message.answer_audio,
                 audio=FSInputFile(it.path, filename="music" + os.path.splitext(it.path)[1]),
                 caption=caption,
                 title=it.title,
                 performer=it.performer,
                 duration=it.duration,
                 **quiet,
-            ))
+            ), on_glitch))
             caption = None
     return sent
 
