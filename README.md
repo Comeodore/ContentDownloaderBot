@@ -3,9 +3,9 @@
 Telegram bot: send a link, get the video or photos back.
 
 - **TikTok**: videos without watermark, photo slideshows with their music
-- **Instagram**: reels, posts, carousels, stories
+- **Instagram**: public reels, posts, carousels
 - **YouTube**: Shorts, videos, clips
-- **Threads**: videos, photos, carousels
+- **Threads**: public videos, photos, carousels
 
 Timecodes after a link (`<link> 1:00-1:10, 2:10-2:55`) cut clips.
 
@@ -38,8 +38,8 @@ Offline: no network, Telegram or real downloads.
 |---|---|
 | `BOT_TOKEN` | token from [@BotFather](https://t.me/BotFather) (required) |
 | `MAX_FILE_SIZE_MB` | file size limit: `49` without a local server, up to `1900` with one |
-| `COOKIES_FILE` | path to `cookies.txt` (logged-in sessions, see below) |
-| `OWNER_ID` | owner's Telegram id: uploads cookies, gets failure reports and cookie reminders |
+| `COOKIES_FILE` | path to `cookies.txt` (TikTok/YouTube sessions; Instagram and Threads never get cookies, see below) |
+| `OWNER_ID` | owner's Telegram id: uploads cookies, gets failure reports |
 | `YTDLP_AUTO_UPDATE_HOURS` | restart period to update yt-dlp (`0` = off) |
 | `TELEGRAM_API_BASE` | local Bot API server URL, for files up to 2 GB |
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | from my.telegram.org, local server only |
@@ -95,20 +95,19 @@ Logs: `docker compose logs -f bot`.
 - **Bot API server**: the host's shared Watchtower pulls new images. The stack has no Watchtower of its own: a second unscoped instance stops and removes the first. On a host without one, add it.
 - **Bot image**: built locally, updated by rebuilding.
 
-## Cookies for Instagram and Threads
-
-Instagram and Threads are fetched **as a guest first**: public posts, reels and carousels need no login. The session from `cookies.txt` is used only for what guests don't get: stories, private accounts, posts hidden from logged-out visitors. Without it those links fail with "Cookie problem: …", and the owner isn't notified.
-
-To add a session:
+## Cookies (TikTok, YouTube)
 
 1. Install the **Get cookies.txt LOCALLY** browser extension.
-2. Log in to Instagram, or to threads.com for Threads (Instagram cookies don't work there).
-3. Export **only the current site**, not all cookies: the bot replaces every site found in the file.
-4. Send the file to the bot as a document (owner only); it's merged into the existing one.
+2. Log in to the site and export **only the current site**, not all cookies: the bot replaces every site found in the file.
+3. Send the file to the bot as a document (owner only); it's merged into the existing one.
 
-If a link fails under the session too, the user sees "Cookie problem: the saved … cookies …" and the owner is asked for fresh cookies.
+## Instagram and Threads: guest only
 
-> ⚠️ Use a secondary account only. The bot is public and Instagram counts every session request against the account: in 2026-11 the account all links went through was locked for automated activity.
+Instagram and Threads are fetched **as a guest only**: the bot never sends them cookies, even if `cookies.txt` has some (an upload of their cookies is saved but reported as not used). Public posts, reels and carousels need no login.
+
+Guests don't get stories, private accounts, or age- and audience-restricted posts. For those the user sees "Instagram/Threads shows this post only to signed-in users … I download without an account, so this one is out of my reach." Such a failure is only logged (`Download failed for …`): the owner gets no report, and Claude's worker gets nothing. A deleted Instagram post gets the same message, since to a guest it looks the same.
+
+> ⚠️ Why no account: the bot is public, and Instagram most likely takes a browser session replayed from a server for a stolen or automated one. The owner's account was locked twice in 2026-11: once when every link went through it, and again when it was only a fallback (27 requests in 4 days). Don't bring a session back without the owner's OK.
 
 ## Layout
 

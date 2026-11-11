@@ -287,7 +287,8 @@ def _player(monkeypatch, tmp_path, *, gone=(), broken=()):
         n = len(sent_media)
         return [SimpleNamespace(message_id=500 + n, video=SimpleNamespace(file_id=f"F{n}"))]
 
-    async def fake_failure(message, config, url, error, cause=None, user_side=False):
+    async def fake_failure(message, config, url, error, cause=None, user_side=False, report=True):
+        assert report  # watch reports only bot failures; guest walls are skipped as gone
         failures.append((message.from_user.id, url, error, user_side))
 
     monkeypatch.setattr(watch, "_download", fake_download)

@@ -124,23 +124,21 @@ class DownloadError(Exception):
     user_side: the cause is the user's to deal with (deleted post, wrong link, size
         limit), so the bot shows the message. Otherwise the user gets a standard
         "developer notified" reply and the message goes to the log and the alert.
-    auth: the site's saved cookies didn't work, so the owner gets a reminder.
-        Not set when the bot has no cookies for the site at all.
-    no_post: the post page wasn't served (redirect home, empty shell, 404).
-    no_media: the post came without media.
-        Both are worth retrying under the session (see _extract_info).
+    auth: the site wants a login and its saved cookies didn't work. Not set when
+        the bot has no cookies for the site, nor for the guest-only sites.
     waf: the site's WAF rejected the TLS fingerprint (TikTok); retry with
         another impersonate target.
+    guest_wall: Instagram or Threads won't show the post to a guest. User-side,
+        and only logged: the owner asked not to get reports for these (2026-11-11).
     """
 
-    def __init__(self, message: str, auth: bool = False, no_post: bool = False,
-                 no_media: bool = False, waf: bool = False, user_side: bool = False) -> None:
+    def __init__(self, message: str, auth: bool = False, waf: bool = False,
+                 user_side: bool = False, guest_wall: bool = False) -> None:
         super().__init__(message)
-        self.user_side = user_side
+        self.user_side = user_side or guest_wall
         self.auth = auth
-        self.no_post = no_post
-        self.no_media = no_media
         self.waf = waf
+        self.guest_wall = guest_wall
 
 
 def extract_url(text: str) -> str | None:
@@ -314,21 +312,36 @@ _AUTH_MARKERS = (
     "empty media response", "requires authentication", "not a bot",
     # yt-dlp's "Use --cookies… for the authentication": Instagram stories for guests.
     "for the authentication",
-    # Audience-restricted reels: refused to guests, served under the session.
+    # Audience-restricted posts (Instagram reels, Threads' blocked-content page).
     "available to everyone",
 )
 
 # Our Instagram plugin's error for an API redirect to login under the session.
 _SESSION_EXPIRED_MARKERS = ("session expired",)
 
-# The post page wasn't served. Looks the same for a hidden post and a bad
-# session (Threads answers a bad session so even for public posts).
-_NO_POST_MARKERS = (
-    "hidden from logged-out", "could not find post data", "http error 404",
-)
+# Instagram and Threads are downloaded as a guest only, with no account at all
+# (owner's decision, 2026-11-11). A saved session got the owner's account locked
+# twice: on 2026-11-06, when every link went through it, and on 2026-11-10/11,
+# when it was only a fallback (27 requests in 4 days). Don't bring cookies back
+# for these sites without the owner's OK.
+_GUEST_ONLY_SITES = ("instagram", "threads")
 
-# The Threads plugin's "post without media".
-_NO_MEDIA_MARKERS = ("has no photo or video",)
+# What a guest is refused: needs a login, restricted, or hidden from logged-out
+# visitors. Guests can't tell this from a deleted post: Instagram answers a
+# deleted reel with the same "empty media response" (verified 2026-11-10).
+_GUEST_WALL_MARKERS = _AUTH_MARKERS + ("hidden from logged-out", "not shown to logged-out")
+
+_GUEST_ONLY_NOTE = "I download without an account, so this one is out of my reach."
+_GUEST_WALL_MESSAGES = {
+    "instagram": "Instagram shows this post only to signed-in users: it may be "
+                 "age-restricted, from a private account, or deleted. " + _GUEST_ONLY_NOTE,
+    "instagram story": "Instagram shows stories only to signed-in users. I download "
+                       "without an account, so stories are out of my reach.",
+    "threads": "Threads shows this post only to signed-in users: it may be restricted "
+               "or deleted. " + _GUEST_ONLY_NOTE,
+    "threads quote": "This post quotes another one, and Threads shows that one only to "
+                     "signed-in users (or it was deleted). " + _GUEST_ONLY_NOTE,
+}
 
 # The TikTok extractor's failure on a WAF stub or JS challenge.
 _WAF_MARKERS = ("unexpected response from webpage request", "challenge")
@@ -396,14 +409,26 @@ def _cookies_name(site: str | None) -> str:
     return f"{_SITES[site][0]} cookies" if site in _SITES else "cookies for this site"
 
 
+def _guest_wall_error(site: str, raw: str) -> DownloadError:
+    """A guest-only site refused the post to a guest: nothing anyone can fix."""
+    low = raw.lower()
+    if site == "instagram" and "[instagram:story" in low:
+        site = "instagram story"
+    elif site == "threads" and "quoted post" in low:
+        site = "threads quote"
+    return DownloadError(_GUEST_WALL_MESSAGES[site], guest_wall=True)
+
+
 def _as_download_error(e: Exception, site: str | None = None) -> DownloadError:
-    clean = _YTDLP_PREFIX_RE.sub("", _raw_error(e))
+    raw = _raw_error(e)
+    clean = _YTDLP_PREFIX_RE.sub("", raw)
     low = clean.lower()
 
     # Flags come from yt-dlp's text: the translation may lose the words.
-    no_post = any(marker in low for marker in _NO_POST_MARKERS)
-    no_media = any(marker in low for marker in _NO_MEDIA_MARKERS)
     waf = any(marker in low for marker in _WAF_MARKERS)
+
+    if site in _GUEST_ONLY_SITES and any(marker in low for marker in _GUEST_WALL_MARKERS):
+        return _guest_wall_error(site, raw)
 
     # Access errors are cookie problems. Without the site's cookies in the
     # request, _extract_info replaces this with "the bot has no cookies".
@@ -412,23 +437,22 @@ def _as_download_error(e: Exception, site: str | None = None) -> DownloadError:
         return DownloadError(
             f"Cookie problem: the saved {cookies} have expired — the site sends "
             "the bot to its login page.",
-            auth=True, no_post=no_post,
+            auth=True,
         )
     if any(marker in low for marker in _AUTH_MARKERS):
         return DownloadError(
             f"Cookie problem: this needs a login, and the saved {cookies} didn't "
             "get through — they've expired, or their account can't see this.",
-            auth=True, no_post=no_post,
+            auth=True,
         )
     for markers, text, user_side in _ERROR_MESSAGES:
         if any(marker in low for marker in markers):
-            return DownloadError(text, no_post=no_post, no_media=no_media, waf=waf,
-                                 user_side=user_side)
+            return DownloadError(text, waf=waf, user_side=user_side)
 
     # Unknown case: yt-dlp's own text, capped.
     if len(clean) > 200:
         clean = clean[:199].rstrip() + "…"
-    return DownloadError(f"Couldn't download it: {clean}", no_post=no_post, waf=waf)
+    return DownloadError(f"Couldn't download it: {clean}", waf=waf)
 
 
 # ── cookies.txt: per-site replacement ───────────────────────────────────────
@@ -494,21 +518,8 @@ def merge_cookies_file(upload_path: str, target_path: str) -> list[str]:
     return sorted(sites)
 
 
-# Instagram and Threads go as a guest first; the cookies.txt session is only for
-# what guests don't get (stories, private accounts, hidden posts). Every session
-# request counts against a real account: with all links of this public bot going
-# through it, Instagram locked the owner's account (2026-11-06).
-_GUEST_FIRST_SITES = ("instagram", "threads")
-# Both sites' session cookie; without it a request is anonymous anyway.
-_SESSION_COOKIE = "sessionid"
-
-
 def _has_session(cookiefile: str | None, site: str | None) -> bool:
-    """Whether cookies.txt holds a login for the site.
-
-    Instagram and Threads: a sessionid on the site's domain. Others: any of
-    their cookies, since session cookie names differ.
-    """
+    """Whether cookies.txt holds any cookies of the site (session names differ)."""
     if not cookiefile or site not in _SITES:
         return False
     domains = _SITES[site]
@@ -518,8 +529,6 @@ def _has_session(cookiefile: str | None, site: str | None) -> bool:
                 key = _cookie_key(line)
                 if not key:
                     continue
-                if site in _GUEST_FIRST_SITES and key[2] != _SESSION_COOKIE:
-                    continue
                 d = _site_domain(key[0])
                 if any(d == s or d.endswith("." + s) for s in domains):
                     return True
@@ -528,63 +537,32 @@ def _has_session(cookiefile: str | None, site: str | None) -> bool:
     return False
 
 
-def _no_cookies_error(site: str | None, cause: DownloadError) -> DownloadError:
+def unused_cookie_sites(sites: list[str]) -> list[str]:
+    """The uploaded sites whose cookies the bot never sends (_GUEST_ONLY_SITES)."""
+    return [s for s in sites if site_of(f"https://{s}/") in _GUEST_ONLY_SITES]
+
+
+def _no_cookies_error(site: str | None) -> DownloadError:
     """The site wants a login and the bot has no cookies for it.
 
     auth stays False: there's nothing for the owner to renew.
     """
-    what = (" (a story, a private account, or a post hidden from logged-out visitors)"
-            if site in _GUEST_FIRST_SITES else "")
     return DownloadError(
-        f"Cookie problem: this needs a login{what}, and the bot has no "
-        f"{_cookies_name(site)}.",
-        no_post=cause.no_post, no_media=cause.no_media,
+        f"Cookie problem: this needs a login, and the bot has no {_cookies_name(site)}."
     )
 
 
 def _extract_info(opts: dict, url: str) -> dict:
-    """extract_info; Instagram and Threads as a guest first, then under the session."""
+    """extract_info; Instagram and Threads never get cookies (_GUEST_ONLY_SITES)."""
     site = site_of(url)
-    cookiefile = opts.get("cookiefile")
-    if site not in _GUEST_FIRST_SITES:
-        try:
-            return _extract_info_attempts(opts, url)
-        except DownloadError as e:
-            if not e.auth or _has_session(cookiefile, site):
-                raise
-            raise _no_cookies_error(site, e) from e
-    try:
+    if site in _GUEST_ONLY_SITES:
         return _extract_info_attempts({**opts, "cookiefile": None}, url)
-    except DownloadError as guest:
-        # The session only helps with access, hidden or stripped posts.
-        if not (guest.auth or guest.no_post or guest.no_media):
+    try:
+        return _extract_info_attempts(opts, url)
+    except DownloadError as e:
+        if not e.auth or _has_session(opts.get("cookiefile"), site):
             raise
-        if not _has_session(cookiefile, site):
-            # No session: no reminder for the owner; the user is told it's cookies.
-            if guest.auth:
-                raise _no_cookies_error(site, guest) from guest
-            if guest.no_post:
-                raise DownloadError(
-                    "The site didn't hand over this post: it's deleted, or it's a "
-                    "cookie problem — the post is for logged-in users only, and the "
-                    f"bot has no {_cookies_name(site)}.",
-                    no_post=True,
-                ) from guest
-            raise
-        logger.info("%s: guest attempt failed (%s), trying the session", site, guest)
-        try:
-            return _extract_info_attempts(opts, url)
-        except DownloadError as e:
-            if e.auth or not e.no_post:
-                raise
-            # Not served under the session either: deleted, or a bad session
-            # (Threads answers so), which the owner should check.
-            raise DownloadError(
-                "The site didn't hand over this post, as a guest or with the saved "
-                f"{_cookies_name(site)}: it's deleted, or it's a cookie problem — "
-                "the cookies have expired, or their account can't see this post.",
-                auth=True, no_post=True,
-            ) from e
+        raise _no_cookies_error(site) from e
 
 
 def _extract_info_attempts(opts: dict, url: str) -> dict:
@@ -623,8 +601,8 @@ def _to_int(value: object) -> int | None:
 def _cookies_for_run(config: Config, work_dir: str) -> str | None:
     """A one-off copy of cookies.txt for this download.
 
-    yt-dlp writes the cookie jar back to the file, and Threads answers a refused
-    request with a logout that would erase sessionid from the bot's file.
+    yt-dlp writes the cookie jar back to the file, and a site's logout answer
+    would erase the session from the bot's file.
     """
     src = config.cookies_file
     if not src or not os.path.isfile(src):
@@ -674,9 +652,9 @@ def _build_opts(config: Config, out_template: str, url: str, work_dir: str) -> d
         "match_filter": _skip_live,
     }
     # Instagram/Threads carousels are playlists.
-    if site_of(url) in ("instagram", "threads"):
+    if site_of(url) in _GUEST_ONLY_SITES:
         opts["noplaylist"] = False
-    if cookies := _cookies_for_run(config, work_dir):
+    elif cookies := _cookies_for_run(config, work_dir):
         opts["cookiefile"] = cookies
     return opts
 

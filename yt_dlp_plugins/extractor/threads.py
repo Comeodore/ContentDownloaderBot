@@ -7,7 +7,11 @@ gains an extractor, drop this file, but check it handles photos first.
 
 yt-dlp finds it because the bot runs from the project root, which holds the
 `yt_dlp_plugins` package.
+
+The bot runs it as a guest only (downloader._GUEST_ONLY_SITES); the session
+paths below serve manual runs with cookies.
 """
+import json
 import re
 
 from yt_dlp.extractor.common import InfoExtractor
@@ -34,6 +38,13 @@ _CODE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
 # A quote or repost has no media of its own (media_type 19, text); the video is
 # in the source post, under a different key for each kind of share.
 _SHARED_POST_KEYS = ('quoted_attachment_post', 'quoted_post', 'reposted_post')
+
+# A post Threads won't show this visitor comes as an error component in place of
+# the post data, with the reason as its props (verified 2026-11-11 on an
+# audience-restricted post: "This content isn't available to everyone").
+_BLOCKED_RE = re.compile(
+    r'GeoBlockedErrorRoot\.react"\},"props":\{"title":("(?:[^"\\]|\\.)*"),'
+    r'"description":("(?:[^"\\]|\\.)*")')
 
 
 class ThreadsIE(InfoExtractor):
@@ -138,6 +149,17 @@ class ThreadsIE(InfoExtractor):
                 return post
         return None
 
+    @staticmethod
+    def _blocked_reason(webpage):
+        """Threads' reason for serving an error page instead of the post, or None."""
+        mobj = _BLOCKED_RE.search(webpage)
+        if mobj:
+            return ': '.join(filter(None, (json.loads(g).strip() for g in mobj.groups())))
+        if 'GeoBlockedErrorRoot' in webpage:
+            # A new layout of the error page: worth a look, so no access wording.
+            return 'Threads served an error page instead of the post'
+        return None
+
     def _has_session(self):
         return bool(self._get_cookies(_BASE_URL).get('sessionid'))
 
@@ -184,6 +206,8 @@ class ThreadsIE(InfoExtractor):
             post = self._find_post(webpage, video_id)
             if post:
                 return post, webpage
+            if reason := self._blocked_reason(webpage):
+                raise ExtractorError(reason, expected=True)
         return None, webpage
 
     def _real_extract(self, url):

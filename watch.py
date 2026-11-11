@@ -683,7 +683,8 @@ async def _report(bot: Bot, config: Config, p: Post, e: BaseException,
     if what is None:
         what = str(e) if isinstance(e, downloader.DownloadError) else "Unexpected error"
     await _deps.failure(SimpleNamespace(from_user=CHANNEL, bot=bot), config, p.url, what,
-                        downloader.error_detail(e), user_side=False)
+                        downloader.error_detail(e), user_side=False,
+                        report=not getattr(e, "guest_wall", False))
     return what
 
 

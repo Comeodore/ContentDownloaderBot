@@ -59,9 +59,9 @@ watch.register(dp)
 WELCOME = (
     "👋 Hi! Send me a link and I'll send back the video or photos:\n\n"
     "• TikTok — videos without watermark, photo slideshows + their music\n"
-    "• Instagram — Reels, posts, carousels, stories\n"
+    "• Instagram — public Reels, posts, carousels\n"
     "• YouTube — Shorts, videos and clips\n"
-    "• Threads — videos, photos, carousels\n\n"
+    "• Threads — public videos, photos, carousels\n\n"
     "✂️ To cut clips, add timecodes after the link:\n"
     "<code>&lt;link&gt; 1:00-1:10, 2:10-2:55</code>\n"
     # "30 min" is MAX_CUT_SECONDS.
@@ -78,16 +78,11 @@ BOT_DESCRIPTION = (
     "Downloads videos and posts from TikTok, Instagram, YouTube and Threads — "
     "just send a link.\n\n"
     "• TikTok — videos without watermark, photo slideshows with their music\n"
-    "• Instagram — Reels, posts, carousels, stories\n"
+    "• Instagram — public Reels, posts, carousels\n"
     "• YouTube — Shorts, videos and clips\n"
-    "• Threads — videos, photos, carousels\n\n"
+    "• Threads — public videos, photos, carousels\n\n"
     "✂️ Cut clips: add timecodes after the link, e.g. 1:00-1:10, 2:10-2:55"
 )
-
-# Cookie reminders at most every 6 h. -inf, not 0: monotonic() counts from host
-# boot, so right after a reboot 0 would mute the first reminder.
-_last_cookie_notify = {"t": float("-inf")}
-
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
@@ -122,7 +117,11 @@ async def handle_cookies_upload(message: Message, config: Config) -> None:
             )
             return
         os.chmod(config.cookies_file, 0o600)
-        await message.answer("✅ Cookies updated for: " + html.quote(", ".join(domains)))
+        text = "✅ Cookies updated for: " + html.quote(", ".join(domains))
+        if unused := downloader.unused_cookie_sites(domains):
+            text += ("\n⚠️ Not used: " + html.quote(", ".join(unused))
+                     + " — the bot downloads Instagram and Threads without an account.")
+        await message.answer(text)
         logger.info("Cookies updated by owner %s: %s", _who(message), ", ".join(domains))
     except Exception:  # noqa: BLE001
         logger.exception("Couldn't save cookies")
@@ -408,13 +407,14 @@ def _failure_report(message: Message, url: str, error: str, cause: str | None) -
 
 async def _failure(message: Message, config: Config, url: str, error: str,
                    cause: str | None = None, exc_info: bool = False,
-                   user_side: bool = False) -> None:
+                   user_side: bool = False, report: bool = True) -> None:
     """Logs a failure the user saw, reports it to the owner and queues it for Claude.
 
-    Claude's worker answers under the report when it's done.
+    Claude's worker answers under the report when it's done. report=False only
+    logs it: a post closed to guests (DownloadError.guest_wall).
     """
     _log_failure(message, url, error, cause, exc_info=exc_info)
-    if not config.owner_id:
+    if not report or not config.owner_id:
         return
     text = _failure_report(message, url, error, cause)
     text += "\n\n🤖 <i>Sent to Claude automatically</i>"
@@ -462,10 +462,8 @@ async def _report_download_error(
 ) -> None:
     """Logs a download error, reports it to the owner and shows it to the user."""
     await _failure(message, config, url, str(e), downloader.error_detail(e),
-                   user_side=e.user_side)
+                   user_side=e.user_side, report=not e.guest_wall)
     await status.edit_text(f"❌ {html.quote(_user_text(e))}")
-    if e.auth and _needs_cookies(url):
-        await _notify_owner_cookies(message.bot, config, url)
 
 
 async def _handle_full(message: Message, config: Config, url: str) -> None:
@@ -563,7 +561,7 @@ async def _handle_cut(
                     error = (result.errors.get(i)
                              or downloader.DownloadError("couldn't process this piece"))
                     await _failure(message, config, url, f"{label}: {error}",
-                                   user_side=error.user_side)
+                                   user_side=error.user_side, report=not error.guest_wall)
                     text = str(error) if error.user_side else f"{error}. {_NOTIFIED}"
                     await message.answer(f"❌ {label}: {html.quote(text)}")
                     continue
@@ -693,37 +691,6 @@ async def _safe_edit(status: Message, text: str) -> None:
         await status.edit_text(text)
     except Exception:  # noqa: BLE001  (not modified / rate limit)
         pass
-
-
-# Sites with a session in cookies.txt, and the domain named in reminders.
-_COOKIE_SITES = {"instagram": "instagram.com", "threads": "threads.com"}
-
-
-def _needs_cookies(url: str) -> bool:
-    """Whether a login error on this link means the saved cookies failed."""
-    return downloader.site_of(url) in _COOKIE_SITES
-
-
-async def _notify_owner_cookies(bot: Bot, config: Config, url: str) -> None:
-    """Tells the owner the saved session failed, at most every 6 h."""
-    if not config.owner_id:
-        return
-    now = time.monotonic()
-    if now - _last_cookie_notify["t"] < 6 * 3600:
-        return
-    _last_cookie_notify["t"] = now
-    domain = _COOKIE_SITES.get(downloader.site_of(url), "the site")
-    text = (
-        f"⚠️ A <b>{domain}</b> link needed the saved session, and it didn't work "
-        "(login required / rate limit / expired session).\n"
-        f"Export cookies.txt for <b>{domain}</b> — from a secondary account, "
-        "not your main one — and send it here as a document. I merge it into "
-        "the existing file, so the other sites keep working."
-    )
-    try:
-        await bot.send_message(config.owner_id, text)
-    except Exception:  # noqa: BLE001
-        logger.exception("Couldn't send the cookie reminder")
 
 
 # Set by _heartbeat each turn, checked by the watchdog thread.

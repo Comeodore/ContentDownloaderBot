@@ -121,6 +121,16 @@ def test_user_side_failure_goes_to_claude_too(config):
     assert len(inbox.pending(cfg)) == 1
 
 
+def test_closed_to_guests_is_only_logged(config, caplog):
+    cfg, msg = config(), _user_message()
+    with caplog.at_level("INFO", logger="videobot"):
+        asyncio.run(bot._failure(msg, cfg, IG, "Instagram shows this post only to signed-in "
+                                 "users", user_side=True, report=False))
+    msg.bot.send_message.assert_not_awaited()
+    assert inbox.pending(cfg) == []
+    assert any(r.getMessage().startswith("Download failed for 42") for r in caplog.records)
+
+
 def test_unqueued_report_gets_the_button(config, monkeypatch):
     def broken(*_args, **_kwargs):
         raise OSError("disk full")

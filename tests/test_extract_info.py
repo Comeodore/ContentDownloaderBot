@@ -1,17 +1,30 @@
-"""Guest-first / session-fallback logic in _extract_info, with yt-dlp stubbed out."""
+"""_extract_info: Instagram and Threads as a guest only, other sites with cookies."""
 import pytest
 
 import downloader as d
 from conftest import cookie
 
 IG = "https://www.instagram.com/p/abc/"
+STORY = "https://www.instagram.com/stories/someone/3700000000000000000/"
 THREADS = "https://www.threads.com/@u/post/abc"
 YT = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
-LOGIN = "ERROR: [x] abc: This content isn't available to everyone"
-HIDDEN = "ERROR: [Threads] abc: This post is unavailable — it may have been deleted, " \
-         "or it is hidden from logged-out visitors"
+# Real guest answers (2026-11-10/11).
+RESTRICTED = ("ERROR: [Instagram+videobot] abc: This content isn't available to everyone: "
+              "It can't be seen by certain audiences.")
+EMPTY = ("ERROR: [Instagram+videobot] abc: Instagram sent an empty media response. Check if "
+         "this post is accessible in your browser without being logged-in. If it is not, then "
+         "use --cookies-from-browser or --cookies for the authentication.")
+STORY_ERR = ("ERROR: [instagram:story+videobot] 3700000000000000000: This content is "
+             "unreachable. Use --cookies-from-browser or --cookies for the authentication.")
+THREADS_RESTRICTED = ("ERROR: [Threads] abc: This content isn't available to everyone: "
+                      "It can't be seen by certain audiences.")
+HIDDEN = ("ERROR: [Threads] abc: This post is unavailable — it may have been deleted, "
+          "or it is hidden from logged-out visitors")
+QUOTE = ("ERROR: [Threads] abc: The quoted post holding the media is unavailable — it may "
+         "have been deleted, or it is not shown to logged-out visitors")
 NO_MEDIA = "ERROR: [Threads] abc: This Threads post has no photo or video"
+NO_DATA = "ERROR: [Threads] abc: Could not find post data"
 REMOVED = "ERROR: [x] abc: Video unavailable. This video has been removed"
 
 
@@ -40,95 +53,55 @@ def attempts(monkeypatch):
 
 
 @pytest.fixture
-def ig_session(cookie_file):
+def sessions(cookie_file):
     return cookie_file(cookie(".instagram.com", "sessionid"), cookie(".threads.com", "sessionid"))
 
 
-@pytest.fixture
-def no_session(cookie_file):
-    return cookie_file(cookie(".instagram.com", "csrftoken"), cookie(".tiktok.com", "sid_tt"))
-
-
-def test_guest_success_skips_the_session(attempts, ig_session):
+@pytest.mark.parametrize("url", [IG, THREADS])
+def test_guest_only_sites_never_get_cookies(attempts, sessions, url):
     calls = attempts({"id": "ok"})
-    assert d._extract_info({"cookiefile": ig_session}, IG) == {"id": "ok"}
+    assert d._extract_info({"cookiefile": sessions}, url) == {"id": "ok"}
     assert calls == [None]
 
 
-def test_guest_login_error_without_session(attempts, no_session):
-    calls = attempts(LOGIN)
+@pytest.mark.parametrize("url, raw, start", [
+    (IG, RESTRICTED, "Instagram shows this post only to signed-in users"),
+    (IG, EMPTY, "Instagram shows this post only to signed-in users"),
+    (STORY, STORY_ERR, "Instagram shows stories only to signed-in users"),
+    (THREADS, THREADS_RESTRICTED, "Threads shows this post only to signed-in users"),
+    (THREADS, HIDDEN, "Threads shows this post only to signed-in users"),
+    (THREADS, QUOTE, "This post quotes another one, and Threads shows that one only"),
+])
+def test_closed_to_guests_is_one_try_and_no_report(attempts, sessions, url, raw, start):
+    calls = attempts(raw, {"id": "a second try must not happen"})
     with pytest.raises(d.DownloadError) as e:
-        d._extract_info({"cookiefile": no_session}, IG)
-    assert str(e.value).startswith("Cookie problem: this needs a login (a story")
-    assert "the bot has no instagram.com cookies" in str(e.value)
-    assert not e.value.auth  # nothing for the owner to renew
+        d._extract_info({"cookiefile": sessions}, url)
+    assert str(e.value).startswith(start)
+    assert "without an account" in str(e.value)
+    assert e.value.guest_wall and e.value.user_side and not e.value.auth
     assert calls == [None]
 
 
-def test_guest_hidden_post_without_session(attempts, no_session):
-    calls = attempts(HIDDEN)
-    with pytest.raises(d.DownloadError) as e:
-        d._extract_info({"cookiefile": no_session}, THREADS)
-    assert "it's a cookie problem" in str(e.value)
-    assert "the bot has no threads.com cookies" in str(e.value)
-    assert e.value.no_post and not e.value.auth
-    assert calls == [None]
-
-
-def test_guest_text_only_without_session_is_kept(attempts, no_session):
+def test_text_only_threads_post_keeps_its_message(attempts):
     attempts(NO_MEDIA)
-    with pytest.raises(d.DownloadError, match="This post is text only"):
-        d._extract_info({"cookiefile": no_session}, THREADS)
+    with pytest.raises(d.DownloadError, match="This post is text only") as e:
+        d._extract_info({}, THREADS)
+    assert not e.value.guest_wall
 
 
-def test_guest_login_error_falls_back_to_the_session(attempts, ig_session):
-    calls = attempts(LOGIN, {"id": "via session"})
-    assert d._extract_info({"cookiefile": ig_session}, IG) == {"id": "via session"}
-    assert calls == [None, ig_session]
-
-
-@pytest.mark.parametrize("guest", [HIDDEN, NO_MEDIA])
-def test_hidden_or_stripped_posts_fall_back_too(attempts, ig_session, guest):
-    calls = attempts(guest, {"id": "ok"})
-    assert d._extract_info({"cookiefile": ig_session}, THREADS) == {"id": "ok"}
-    assert calls == [None, ig_session]
-
-
-def test_hidden_under_the_session_too_alerts_the_owner(attempts, ig_session):
-    attempts(HIDDEN, HIDDEN)
+def test_page_without_post_data_stays_a_bot_failure(attempts):
+    # Not an access wall Threads named: maybe its page changed, worth a report.
+    attempts(NO_DATA)
     with pytest.raises(d.DownloadError) as e:
-        d._extract_info({"cookiefile": ig_session}, THREADS)
-    assert "as a guest or with the saved threads.com cookies" in str(e.value)
-    assert e.value.auth and e.value.no_post
+        d._extract_info({}, THREADS)
+    assert not e.value.guest_wall and not e.value.user_side
 
 
-def test_session_login_error_is_raised_as_is(attempts, ig_session):
-    attempts(LOGIN, "ERROR: [x] abc: Instagram session expired: the API sent it to the login page")
-    with pytest.raises(d.DownloadError) as e:
-        d._extract_info({"cookiefile": ig_session}, IG)
-    assert "saved instagram.com cookies have expired" in str(e.value)
-    assert e.value.auth
-
-
-def test_session_other_error_is_raised_as_is(attempts, ig_session):
-    attempts(LOGIN, REMOVED)
+def test_other_errors_of_guest_only_sites_pass_through(attempts):
+    attempts(REMOVED)
     with pytest.raises(d.DownloadError, match="no longer available") as e:
-        d._extract_info({"cookiefile": ig_session}, IG)
-    assert not e.value.auth
-
-
-def test_errors_a_session_cant_fix_skip_it(attempts, ig_session):
-    calls = attempts(REMOVED)
-    with pytest.raises(d.DownloadError, match="no longer available"):
-        d._extract_info({"cookiefile": ig_session}, IG)
-    assert calls == [None]
-
-
-def test_no_cookie_file_at_all(attempts):
-    calls = attempts(LOGIN)
-    with pytest.raises(d.DownloadError, match="has no instagram.com cookies"):
         d._extract_info({}, IG)
-    assert calls == [None]
+    assert not e.value.guest_wall
 
 
 def test_other_sites_use_cookies_directly(attempts, cookie_file):
@@ -138,13 +111,13 @@ def test_other_sites_use_cookies_directly(attempts, cookie_file):
     assert calls == [yt]
 
 
-def test_other_sites_login_error_without_cookies(attempts, no_session):
+def test_other_sites_login_error_without_cookies(attempts, sessions):
     calls = attempts("ERROR: [youtube] x: Sign in to confirm you're not a bot")
     with pytest.raises(d.DownloadError) as e:
-        d._extract_info({"cookiefile": no_session}, YT)
+        d._extract_info({"cookiefile": sessions}, YT)
     assert str(e.value) == "Cookie problem: this needs a login, and the bot has no youtube.com cookies."
-    assert not e.value.auth
-    assert calls == [no_session]
+    assert not e.value.auth and not e.value.guest_wall
+    assert calls == [sessions]
 
 
 def test_other_sites_login_error_with_cookies(attempts, cookie_file):
@@ -156,7 +129,17 @@ def test_other_sites_login_error_with_cookies(attempts, cookie_file):
     assert e.value.auth
 
 
-def test_other_sites_plain_errors_pass_through(attempts, no_session):
+def test_other_sites_plain_errors_pass_through(attempts):
     attempts(REMOVED)
     with pytest.raises(d.DownloadError, match="no longer available"):
-        d._extract_info({"cookiefile": no_session}, YT)
+        d._extract_info({}, YT)
+
+
+@pytest.mark.parametrize("url, gets_cookies", [(IG, False), (THREADS, False), (YT, True)])
+def test_build_opts_copies_cookies_only_for_other_sites(config, sessions, tmp_path, url,
+                                                        gets_cookies):
+    work = tmp_path / "work"
+    work.mkdir()
+    opts = d._build_opts(config(sessions), str(work / "%(id)s.%(ext)s"), url, str(work))
+    assert ("cookiefile" in opts) is gets_cookies
+    assert (work / "cookies.txt").exists() is gets_cookies

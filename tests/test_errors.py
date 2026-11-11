@@ -9,9 +9,8 @@ def err(raw, site=None):
 
 
 def test_session_expired_names_the_sites_cookies():
-    e = err("ERROR: [Instagram+videobot] 123: Instagram session expired: "
-            "the API sent it to the login page", "instagram")
-    assert str(e).startswith("Cookie problem: the saved instagram.com cookies have expired")
+    e = err("ERROR: [x] 123: session expired: the API sent it to the login page", "tiktok")
+    assert str(e).startswith("Cookie problem: the saved tiktok.com cookies have expired")
     assert e.auth
 
 
@@ -27,9 +26,26 @@ def test_session_expired_names_the_sites_cookies():
     "ERROR: [TikTok] x: This video is private",
 ])
 def test_auth_errors_are_cookie_problems(raw):
-    e = err(raw, "instagram")
-    assert e.auth
-    assert str(e).startswith("Cookie problem: this needs a login, and the saved instagram.com cookies")
+    e = err(raw, "youtube")
+    assert e.auth and not e.guest_wall
+    assert str(e).startswith("Cookie problem: this needs a login, and the saved youtube.com cookies")
+
+
+@pytest.mark.parametrize("site", ["instagram", "threads"])
+@pytest.mark.parametrize("raw", [
+    "ERROR: [Instagram] x: Requested content is not available, rate-limit reached or login required",
+    "ERROR: [Instagram] x: This content isn't available to everyone: "
+    "It can't be seen by certain audiences.",
+    "ERROR: [Instagram] x: Instagram sent an empty media response.",
+    "ERROR: [Instagram] x: Instagram session expired: the API sent it to the login page",
+    "ERROR: [Threads] x: This post is unavailable — it may have been deleted, "
+    "or it is hidden from logged-out visitors",
+])
+def test_guest_only_sites_name_no_cookies(raw, site):
+    e = err(raw, site)
+    assert e.guest_wall and e.user_side and not e.auth
+    assert "cookie" not in str(e).lower()
+    assert str(e).endswith("I download without an account, so this one is out of my reach.")
 
 
 def test_cookie_message_without_a_known_site():
@@ -37,24 +53,18 @@ def test_cookie_message_without_a_known_site():
 
 
 def test_session_expired_wins_over_plain_login():
-    e = err("session expired, please log in", "threads")
-    assert "have expired" in str(e) and "threads.com cookies" in str(e)
+    e = err("session expired, please log in", "tiktok")
+    assert "have expired" in str(e) and "tiktok.com cookies" in str(e)
 
 
-@pytest.mark.parametrize("raw, flag", [
-    ("ERROR: [Threads] x: This post is unavailable — it may have been deleted, "
-     "or it is hidden from logged-out visitors", "no_post"),
-    ("ERROR: [Threads] x: Could not find post data", "no_post"),
-    ("ERROR: [Instagram] x: HTTP Error 404: Not Found", "no_post"),
-    ("ERROR: [Threads] x: This Threads post has no photo or video", "no_media"),
-    ("ERROR: [TikTok] x: Unexpected response from webpage request", "waf"),
+@pytest.mark.parametrize("raw, waf", [
+    ("ERROR: [TikTok] x: Unexpected response from webpage request", True),
+    ("ERROR: [TikTok] x: HTTP Error 404: Not Found", False),
 ])
-def test_flags(raw, flag):
-    e = err(raw)
-    assert getattr(e, flag)
-    assert not e.auth
-    for other in {"no_post", "no_media", "waf"} - {flag}:
-        assert not getattr(e, other)
+def test_waf_flag(raw, waf):
+    e = err(raw, "tiktok")
+    assert e.waf is waf
+    assert not e.auth and not e.guest_wall
 
 
 @pytest.mark.parametrize("raw, message", [

@@ -9,18 +9,13 @@ from conftest import HEADER, cookie
 
 
 @pytest.mark.parametrize("records, site, expected", [
-    ([cookie(".instagram.com", "sessionid")], "instagram", True),
-    ([cookie(".instagram.com", "csrftoken"), cookie(".instagram.com", "ds_user_id")],
-     "instagram", False),
-    ([cookie("#HttpOnly_.www.threads.com", "sessionid")], "threads", True),
-    ([cookie("i.instagram.com", "sessionid")], "instagram", True),
-    # An Instagram session isn't a Threads one.
-    ([cookie(".instagram.com", "sessionid")], "threads", False),
-    # Other sites: any cookie counts.
+    # Any cookie of the site counts: session cookie names differ.
     ([cookie(".youtube.com", "VISITOR_INFO1_LIVE")], "youtube", True),
+    ([cookie("#HttpOnly_.www.youtube.com", "SID")], "youtube", True),
+    ([cookie("m.youtube.com", "SID")], "youtube", True),
     ([cookie(".tiktok.com", "ttwid")], "tiktok", True),
     ([cookie(".youtube.com", "SID")], "tiktok", False),
-    ([cookie(".notinstagram.com", "sessionid")], "instagram", False),
+    ([cookie(".notyoutube.com", "SID")], "youtube", False),
 ])
 def test_has_session(cookie_file, records, site, expected):
     assert d._has_session(cookie_file(*records), site) is expected
@@ -32,6 +27,15 @@ def test_has_session_without_file_or_site(cookie_file, tmp_path):
     assert not d._has_session(path, None)
     assert not d._has_session(path, "example")
     assert not d._has_session(str(tmp_path / "missing.txt"), "instagram")
+
+
+@pytest.mark.parametrize("sites, unused", [
+    (["instagram.com", "tiktok.com"], ["instagram.com"]),
+    (["i.instagram.com", "threads.com", "threads.net"], ["i.instagram.com", "threads.com", "threads.net"]),
+    (["youtube.com", "tiktok.com"], []),
+])
+def test_unused_cookie_sites(sites, unused):
+    assert d.unused_cookie_sites(sites) == unused
 
 
 def records(path):

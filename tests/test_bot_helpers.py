@@ -88,17 +88,6 @@ def test_long_captions_are_cut():
     assert caption.endswith("…") and utf16_len(caption) <= bot.CAPTION_LIMIT
 
 
-@pytest.mark.parametrize("url, expected", [
-    ("https://www.instagram.com/p/abc/", True),
-    ("https://www.threads.com/@u/post/abc", True),
-    ("https://www.tiktok.com/@u/video/1", False),
-    ("https://youtu.be/abc", False),
-    ("https://example.com/", False),
-])
-def test_needs_cookies(url, expected):
-    assert bot._needs_cookies(url) is expected
-
-
 class _FakeChat:
     """A Message stand-in that records what's sent into its chat."""
 

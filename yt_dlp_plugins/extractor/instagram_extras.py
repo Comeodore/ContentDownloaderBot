@@ -22,8 +22,9 @@ answers media/<pk>/info/ with 400 "Media not found or unavailable" (verified
 
 Dead session: the API redirects to /accounts/login/ with a 200 HTML page
 (verified 2026-11-06), which yt-dlp misreads as "Failed to parse JSON". We raise
-"session expired" instead; no guest fallback, since the bot only uses the
-session after the guest attempt failed (downloader._extract_info).
+"session expired" instead, with no guest fallback. The bot itself runs Instagram
+as a guest only (downloader._GUEST_ONLY_SITES): the session paths here serve
+manual runs with cookies.
 
 Native H.264: a guest gets 1080p only as VP9 DASH, and the progressive mp4s
 (H.264 720p) come without codec or size (verified 2026-11-08). The bot then took

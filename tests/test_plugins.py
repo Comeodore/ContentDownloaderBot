@@ -196,6 +196,33 @@ def test_threads_code_to_pk(code, pk):
     assert ThreadsIE._pk_from_code(code) == pk
 
 
+_BLOCKED_PAGE = (
+    '<script>{"__bbox":{"__dr":"BarcelonaGeoBlockedErrorRoot.react"},"props":{"title":'
+    '"This content isn\'t available to everyone","description":"It can\'t be seen by '
+    'certain audiences.","geoBlockRuleType":null,"mediaPk":"4025094595724978102"}}</script>')
+
+
+@pytest.mark.parametrize("page, reason", [
+    (_BLOCKED_PAGE,
+     "This content isn't available to everyone: It can't be seen by certain audiences."),
+    # JSON escapes in the props are decoded.
+    (_BLOCKED_PAGE.replace("isn't", "isn\\u2019t"),
+     "This content isn\u2019t available to everyone: It can't be seen by certain audiences."),
+    ('{"__dr":"BarcelonaGeoBlockedErrorRoot.react"},"props":{"other":1}',
+     "Threads served an error page instead of the post"),
+    ('<html>"code":"abc"</html>', None),
+])
+def test_threads_blocked_reason(page, reason):
+    assert ThreadsIE._blocked_reason(page) == reason
+
+
+def test_threads_blocked_page_is_closed_to_guests():
+    reason = ThreadsIE._blocked_reason(_BLOCKED_PAGE)
+    e = downloader._as_download_error(Exception(f"ERROR: [Threads] abc: {reason}"), "threads")
+    assert e.guest_wall
+    assert str(e).startswith("Threads shows this post only to signed-in users")
+
+
 def test_threads_code_with_foreign_characters():
     assert ThreadsIE._pk_from_code("abc.def") is None
 
